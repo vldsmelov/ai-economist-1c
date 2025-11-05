@@ -15,11 +15,11 @@ RUN apt-get update \
 COPY pyproject.toml README.md ./
 
 # Copy application source
-COPY ai_economist_service ./ai_economist_service
+COPY service ./service
 COPY scripts ./scripts
 
 RUN pip install --no-cache-dir .
 
 EXPOSE 8000
 
-CMD ["uvicorn", "ai_economist_service.api.app:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uvicorn", "service.api.app:app", "--host", "0.0.0.0", "--port", "8000"]

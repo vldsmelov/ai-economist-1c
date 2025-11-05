@@ -7,11 +7,11 @@ PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
-from ai_economist_service.simulation import Simulation, SimulationConfig
+from service.simulation import Simulation, SimulationConfig
 
 try:
     from fastapi.testclient import TestClient
-    from ai_economist_service.api.app import app
+    from service.api.app import app
 except ModuleNotFoundError:  # pragma: no cover - optional dependency for tests
     TestClient = None
     app = None
