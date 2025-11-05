@@ -1,13 +1,11 @@
-version: "3.9"
-
 services:
   service:
     build: .
     ports:
       - "8081:8000"
     depends_on:
-      ollama-model:
-        condition: service_completed_successfully
+      ollama:
+        condition: service_healthy
     environment:
       - OLLAMA_HOST=http://ollama:11434
     command: ["uvicorn", "service.api.app:app", "--host", "0.0.0.0", "--port", "8000"]
@@ -35,20 +33,6 @@ services:
       interval: 30s
       timeout: 10s
       retries: 5
-
-  ollama-model:
-    image: ollama/ollama:latest
-    depends_on:
-      ollama:
-        condition: service_healthy
-    environment:
-      - OLLAMA_HOST=http://ollama:11434
-      - NVIDIA_VISIBLE_DEVICES=all
-      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
-    volumes:
-      - ollama:/root/.ollama
-    command: ["ollama", "pull", "krith/qwen2.5-32b-instruct:IQ4_XS"]
-    restart: "no"
 
 volumes:
   ollama:
