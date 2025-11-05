@@ -55,7 +55,7 @@ def llm_test() -> dict[str, str]:
     """Send a test prompt to the configured Ollama LLM service."""
 
     host = os.getenv("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
-    model = os.getenv("OLLAMA_MODEL", "llama3")
+    model = os.getenv("OLLAMA_MODEL", "krith/qwen2.5-32b-instruct:IQ4_XS")
     url = f"{host}/api/generate"
     payload = {"model": model, "prompt": "Представься", "stream": False}
 
@@ -68,7 +68,7 @@ def llm_test() -> dict[str, str]:
     )
 
     try:
-        with request.urlopen(http_request, timeout=30.0) as http_response:
+        with request.urlopen(http_request, timeout=300.0) as http_response:
             body = http_response.read().decode("utf-8")
             data = json.loads(body)
     except error.HTTPError as exc:
