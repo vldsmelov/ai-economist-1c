@@ -24,4 +24,4 @@ dev = [
 ]
 
 [tool.setuptools.packages.find]
-include = ["ai_economist_service*", "scripts"]
+include = ["service*", "scripts"]

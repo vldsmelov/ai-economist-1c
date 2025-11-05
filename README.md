@@ -7,33 +7,52 @@
 
 ## Основные компоненты
 
-* **`ai_economist_service.environment`** — упрощённое грид-окружение с агентами,
+* **`service.environment`** — упрощённое грид-окружение с агентами,
   которые перемещаются, добывают ресурсы и зарабатывают доход.
-* **`ai_economist_service.planner`** — реализация прогрессивной налоговой системы
+* **`service.planner`** — реализация прогрессивной налоговой системы
   с перераспределением собранных средств.
-* **`ai_economist_service.simulation`** — единая точка оркестрации, объединяющая
+* **`service.simulation`** — единая точка оркестрации, объединяющая
   окружение и планировщика, а также предоставляющая удобный API для запуска
   эпизодов и сериализации их результатов.
-* **`ai_economist_service.api`** — REST API на базе FastAPI, которое предоставляет
+* **`service.api`** — REST API на базе FastAPI, которое предоставляет
   эндпоинт `/simulate` для запуска эпизода по входной конфигурации.
 * **`scripts/run_episode.py`** — CLI-утилита для запуска симуляции из командной
   строки.
 
 ## Быстрый старт
 
-```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -e .[dev]
-uvicorn ai_economist_service.api.app:app --reload
-```
+1. Соберите и поднимите сервис:
 
-После запуска сервиса отправьте POST-запрос на `/simulate`:
+   ```bash
+   docker compose up --build
+   ```
+
+   Сервис станет доступен по адресу `http://localhost:8081`,
+   а локальный Ollama-сервер — на `http://localhost:11435`.
+
+2. После того как контейнер `ollama` перейдёт в состояние `healthy`, вручную
+   загрузите модель:
+
+   ```bash
+   docker compose exec ollama ollama pull krith/qwen2.5-32b-instruct:IQ4_XS
+   ```
+
+   Команда выводит прогресс скачивания и завершится после того, как модель
+   окажется в локальном кэше Ollama.
+
+3. Запустите эпизод, отправив POST-запрос на `/simulate`:
+
+   ```bash
+   curl -X POST http://localhost:8081/simulate \
+     -H "Content-Type: application/json" \
+     -d '{"steps": 20, "seed": 123}'
+   ```
+
+Для быстрого теста сервиса предусмотрен GET-запрос на `/simulate/test`, который
+возвращает результат короткого детерминированного эпизода:
 
 ```bash
-curl -X POST http://localhost:8000/simulate \
-  -H "Content-Type: application/json" \
-  -d '{"steps": 20, "seed": 123}'
+curl http://localhost:8081/simulate/test
 ```
 
 ## Тестирование
