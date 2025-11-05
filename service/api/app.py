@@ -164,13 +164,39 @@ async def llm_analyse_purchases(request: Request) -> dict[str, object]:
     if not cleaned_content:
         raise HTTPException(status_code=400, detail="Файл пуст или не содержит данных")
 
+    budget_categories = budget_manager.categories()
+    categories_payload = [
+        {
+            "category": category.name,
+            "limit": category.limit,
+            "keywords": category.keywords,
+        }
+        for category in budget_categories
+    ]
+    categories_json = json.dumps(categories_payload, ensure_ascii=False, indent=2)
+    if categories_payload:
+        categories_instruction = (
+            "Поле \"категория\" заполни точным названием одной из категорий бюджета из списка "
+            "ниже (см. значение ключа \"category\"). Подбирай категорию на основе названия товара "
+            "и ключевых слов. Если подходящую категорию определить нельзя, используй значение null."
+        )
+    else:
+        categories_instruction = (
+            "Категории бюджета не загружены. Для поля \"категория\" используй значение null."
+        )
+
     prompt = (
         "Проанализируй таблицу закупок ниже. Верни только валидный JSON-объект, где "
         "каждый ключ — точное наименование товара из таблицы (без порядковых номеров), "
-        "а значение — объект с полями \"цена\", \"количество\", \"сумма\". Значения полей "
-        "должны быть строками и полностью совпадать с исходными данными. Игнорируй строки "
-        "с итогами, НДС и прочей служебной информацией. Не добавляй пояснений и текста вне JSON.\n"
-        f"Таблица закупок:\n{cleaned_content}"
+        "а значение — объект с полями \"цена\", \"количество\", \"сумма\", \"категория\". Значения "
+        "полей \"цена\", \"количество\" и \"сумма\" должны быть строками и полностью совпадать с исходными "
+        "данными. Игнорируй строки с итогами, НДС и прочей служебной информацией. Не добавляй "
+        "пояснений и текста вне JSON. "
+        + categories_instruction
+        + "\n\nКатегории бюджета (JSON):\n"
+        + categories_json
+        + "\n\nТаблица закупок:\n"
+        + cleaned_content
     )
 
     llm_response = _call_llm(prompt)
@@ -183,6 +209,9 @@ async def llm_analyse_purchases(request: Request) -> dict[str, object]:
     if not isinstance(parsed_response, dict):
         raise HTTPException(status_code=502, detail="LLM service returned invalid JSON structure")
 
+    known_categories = {
+        category.normalised_name(): category.name for category in budget_categories
+    }
     validated_response: dict[str, dict[str, object]] = {}
     for product_name, data in parsed_response.items():
         if not isinstance(product_name, str) or not isinstance(data, dict):
@@ -198,7 +227,19 @@ async def llm_analyse_purchases(request: Request) -> dict[str, object]:
         if not all(isinstance(value, str) and value for value in (price, quantity, total)):
             raise HTTPException(status_code=502, detail="LLM service returned invalid field types")
 
-        category_name, _ = budget_manager.categorise(product_name)
+        category_value = data.get("категория")
+        if category_value is not None and not isinstance(category_value, str):
+            raise HTTPException(status_code=502, detail="LLM service returned invalid category field")
+
+        category_name: str | None = None
+        if isinstance(category_value, str):
+            stripped_category = category_value.strip()
+            if stripped_category:
+                category_name = known_categories.get(stripped_category.lower(), stripped_category)
+
+        if category_name is None:
+            auto_category, _ = budget_manager.categorise(product_name)
+            category_name = auto_category
 
         validated_response[product_name] = {
             "цена": price,
