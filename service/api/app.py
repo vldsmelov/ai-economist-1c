@@ -5,7 +5,7 @@ import json
 import os
 from urllib import error, request
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 
 from ..budget import BudgetCategory, CategorySummary, PurchaseItem, budget_manager
 from .schemas import (
@@ -50,14 +50,13 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
-@app.get("/llmtest")
-def llm_test() -> dict[str, str]:
-    """Send a test prompt to the configured Ollama LLM service."""
+def _call_llm(prompt: str) -> str:
+    """Send a prompt to the configured Ollama LLM service and return the reply."""
 
     host = os.getenv("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
     model = os.getenv("OLLAMA_MODEL", "krith/qwen2.5-32b-instruct:IQ4_XS")
     url = f"{host}/api/generate"
-    payload = {"model": model, "prompt": "Представься", "stream": False}
+    payload = {"model": model, "prompt": prompt, "stream": False}
 
     encoded_payload = json.dumps(payload).encode("utf-8")
     http_request = request.Request(
@@ -90,7 +89,126 @@ def llm_test() -> dict[str, str]:
             detail="LLM service did not return a response",
         )
 
-    return {"prompt": payload["prompt"], "response": llm_response}
+    return llm_response
+
+
+@app.get("/llmtest")
+def llm_test() -> dict[str, str]:
+    """Send a test prompt to the configured Ollama LLM service."""
+
+    prompt = "Представься"
+    llm_response = _call_llm(prompt)
+
+    return {"prompt": prompt, "response": llm_response}
+
+
+def _extract_boundary(content_type: str) -> str | None:
+    for part in content_type.split(";"):
+        part = part.strip()
+        if part.startswith("boundary="):
+            boundary = part.split("=", 1)[1].strip()
+            if boundary.startswith("\"") and boundary.endswith("\""):
+                boundary = boundary[1:-1]
+            return boundary
+    return None
+
+
+def _parse_multipart_file(body: bytes, boundary: str) -> bytes:
+    delimiter = f"--{boundary}".encode()
+    sections = body.split(delimiter)
+
+    for section in sections:
+        section = section.strip(b"\r\n")
+        if not section or section in {b"--", b"--\r\n"}:
+            continue
+
+        if section.endswith(b"--"):
+            section = section[:-2]
+
+        header_sep = b"\r\n\r\n"
+        if header_sep not in section:
+            header_sep = b"\n\n"
+
+        _, _, data = section.partition(header_sep)
+        if not data:
+            continue
+
+        return data.rstrip(b"\r\n")
+
+    raise HTTPException(status_code=400, detail="Не удалось прочитать файл из формы")
+
+
+@app.post("/llm/purchases")
+async def llm_analyse_purchases(request: Request) -> dict[str, object]:
+    """Analyse a purchases file with the LLM and return the JSON result."""
+
+    body = await request.body()
+
+    content_type = request.headers.get("content-type", "")
+    if "multipart/form-data" in content_type.lower():
+        boundary = _extract_boundary(content_type)
+        if not boundary:
+            raise HTTPException(status_code=400, detail="Граница multipart-запроса не найдена")
+        file_content = _parse_multipart_file(body, boundary)
+    else:
+        file_content = body
+
+    if not file_content:
+        raise HTTPException(status_code=400, detail="Файл пуст или не содержит данных")
+
+    try:
+        content = file_content.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise HTTPException(status_code=400, detail="Файл должен быть в кодировке UTF-8") from exc
+
+    cleaned_content = content.strip()
+    if not cleaned_content:
+        raise HTTPException(status_code=400, detail="Файл пуст или не содержит данных")
+
+    prompt = (
+        "Проанализируй таблицу закупок ниже. Верни только валидный JSON-объект, где "
+        "каждый ключ — точное наименование товара из таблицы (без порядковых номеров), "
+        "а значение — объект с полями \"цена\", \"количество\", \"сумма\". Значения полей "
+        "должны быть строками и полностью совпадать с исходными данными. Игнорируй строки "
+        "с итогами, НДС и прочей служебной информацией. Не добавляй пояснений и текста вне JSON.\n"
+        f"Таблица закупок:\n{cleaned_content}"
+    )
+
+    llm_response = _call_llm(prompt)
+
+    try:
+        parsed_response = json.loads(llm_response)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=502, detail="LLM service returned invalid JSON") from exc
+
+    if not isinstance(parsed_response, dict):
+        raise HTTPException(status_code=502, detail="LLM service returned invalid JSON structure")
+
+    validated_response: dict[str, dict[str, str]] = {}
+    for product_name, data in parsed_response.items():
+        if not isinstance(product_name, str) or not isinstance(data, dict):
+            raise HTTPException(status_code=502, detail="LLM service returned invalid JSON structure")
+
+        try:
+            price = data["цена"]
+            quantity = data["количество"]
+            total = data["сумма"]
+        except KeyError as exc:
+            raise HTTPException(status_code=502, detail="LLM service returned incomplete data") from exc
+
+        if not all(isinstance(value, str) and value for value in (price, quantity, total)):
+            raise HTTPException(status_code=502, detail="LLM service returned invalid field types")
+
+        validated_response[product_name] = {
+            "цена": price,
+            "количество": quantity,
+            "сумма": total,
+        }
+
+    if not validated_response:
+        raise HTTPException(status_code=502, detail="LLM service returned empty result")
+
+    return validated_response
 
 
 @app.post("/budget", response_model=BudgetResponse)
