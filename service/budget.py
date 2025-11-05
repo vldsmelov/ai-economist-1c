@@ -8,6 +8,62 @@ from decimal import Decimal, InvalidOperation
 from io import StringIO
 from pathlib import Path
 from typing import Callable, Iterable, List, Optional, Tuple
+import re
+from textwrap import shorten
+
+def _llm_excerpt(text: str, limit: int = 2000) -> str:
+    """Возвращает усечённый сырой ответ LLM для сообщений об ошибках."""
+    cleaned = (text or "").strip()
+    if len(cleaned) <= limit:
+        return cleaned
+    return cleaned[: limit - 1] + "…"
+
+def _extract_json_payload(text: str) -> str:
+    """Извлекает JSON из ответа модели (```json ... ```, прелюдия и т.п.)."""
+    if not text:
+        return ""
+    s = text.strip()
+    # 1) Целиком в код-блоке ```json ... ```
+    m = re.match(r"^```(?:json)?\s*(.*?)\s*```$", s, flags=re.IGNORECASE | re.DOTALL)
+    if m:
+        return m.group(1)
+    # 2) Код-блок встречается внутри текста
+    m = re.search(r"```(?:json)?\s*(.*?)\s*```", s, flags=re.IGNORECASE | re.DOTALL)
+    if m:
+        return m.group(1)
+    # 3) Текстовая прелюдия: берём первый сбалансированный объект/массив
+    start = next((i for i,ch in enumerate(s) if ch in "{["), None)
+    if start is None:
+        return s
+    stack = [s[start]]
+    in_str = False
+    esc = False
+    for j in range(start + 1, len(s)):
+        ch = s[j]
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        else:
+            if ch == '"':
+                in_str = True
+                continue
+            if ch in "{[":
+                stack.append(ch)
+            elif ch in "}]":
+                if not stack:
+                    break
+                open_ch = stack.pop()
+                if (open_ch == "{" and ch != "}") or (open_ch == "[" and ch != "]"):
+                    break
+                if not stack:
+                    return s[start : j + 1]
+    return s
+
 
 
 @dataclass
@@ -120,10 +176,17 @@ def parse_budget_csv(content: bytes, *, call_llm: Callable[[str], str]) -> List[
     )
 
     llm_response = call_llm(prompt)
+    try:
+        limits = _parse_llm_budget_response(llm_response)
+    except ValueError as exc:
+        # Приложим сырой ответ модели к сообщению об ошибке (только один раз)
+        raise ValueError(f"{exc}\n\nСырой ответ LLM:\n{_llm_excerpt(llm_response)}") from exc
 
-    limits = _parse_llm_budget_response(llm_response)
     if not limits:
-        raise ValueError("LLM не вернул данные о категориях бюджета")
+        raise ValueError(
+            "LLM не вернул данные о категориях бюджета.\n\n"
+            f"Сырой ответ LLM:\n{_llm_excerpt(llm_response)}"
+        )
 
     keywords_map = _extract_keywords_from_csv(text)
 
@@ -138,8 +201,11 @@ def parse_budget_csv(content: bytes, *, call_llm: Callable[[str], str]) -> List[
             limit_value = _normalise_number(str(value))
         except ValueError as exc:
             raise ValueError(
-                f"Не удалось обработать значение '{value}' для категории '{category_name}'"
+                "Не удалось обработать значение "
+                f"'{value}' для категории '{category_name}'.\n\n"
+                f"Сырой ответ LLM:\n{_llm_excerpt(llm_response)}"
             ) from exc
+        
 
         normalised_name = category_name.lower()
         keywords = keywords_map.get(normalised_name, [])
@@ -167,9 +233,11 @@ def _decode_budget_content(content: bytes) -> str:
 
 
 def _parse_llm_budget_response(response: str) -> dict[str, object]:
+    payload = _extract_json_payload(response)
     try:
-        data = json.loads(response)
+        data = json.loads(payload)
     except json.JSONDecodeError as exc:  # pragma: no cover - depends on LLM behaviour
+        # Внутри не прикладываем сырой ответ — это делает внешний уровень
         raise ValueError("LLM вернул некорректный JSON") from exc
 
     extracted: dict[str, object] = {}
