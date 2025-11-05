@@ -5,7 +5,7 @@ import argparse
 import json
 from pathlib import Path
 
-from ai_economist_service.simulation import Simulation, SimulationConfig
+from service.simulation import Simulation, SimulationConfig
 
 
 def parse_args() -> argparse.Namespace:
