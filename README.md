@@ -21,26 +21,38 @@
 
 ## Быстрый старт
 
-```bash
-docker compose up --build
-```
+1. Соберите и поднимите сервис:
 
-После запуска контейнера сервис доступен по адресу `http://localhost:8081`.
-Локальный Ollama-сервер доступен на `http://localhost:11435` и автоматически
-предзагружает модель `krith/qwen2.5-32b-instruct:IQ4_XS`.
-Для запуска эпизода отправьте POST-запрос на `/simulate`:
+   ```bash
+   docker compose up --build
+   ```
 
-```bash
-curl -X POST http://localhost:8000/simulate \
-  -H "Content-Type: application/json" \
-  -d '{"steps": 20, "seed": 123}'
-```
+   Сервис станет доступен по адресу `http://localhost:8081`,
+   а локальный Ollama-сервер — на `http://localhost:11435`.
+
+2. После того как контейнер `ollama` перейдёт в состояние `healthy`, вручную
+   загрузите модель:
+
+   ```bash
+   docker compose exec ollama ollama pull krith/qwen2.5-32b-instruct:IQ4_XS
+   ```
+
+   Команда выводит прогресс скачивания и завершится после того, как модель
+   окажется в локальном кэше Ollama.
+
+3. Запустите эпизод, отправив POST-запрос на `/simulate`:
+
+   ```bash
+   curl -X POST http://localhost:8081/simulate \
+     -H "Content-Type: application/json" \
+     -d '{"steps": 20, "seed": 123}'
+   ```
 
 Для быстрого теста сервиса предусмотрен GET-запрос на `/simulate/test`, который
 возвращает результат короткого детерминированного эпизода:
 
 ```bash
-curl http://localhost:8000/simulate/test
+curl http://localhost:8081/simulate/test
 ```
 
 ## Тестирование
