@@ -5,7 +5,7 @@ import json
 import os
 from urllib import error, request
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Body, FastAPI, HTTPException
 
 from ..budget import BudgetCategory, CategorySummary, PurchaseItem, budget_manager
 from .schemas import (
@@ -50,14 +50,13 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
-@app.get("/llmtest")
-def llm_test() -> dict[str, str]:
-    """Send a test prompt to the configured Ollama LLM service."""
+def _call_llm(prompt: str) -> str:
+    """Send a prompt to the configured Ollama LLM service and return the reply."""
 
     host = os.getenv("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
     model = os.getenv("OLLAMA_MODEL", "krith/qwen2.5-32b-instruct:IQ4_XS")
     url = f"{host}/api/generate"
-    payload = {"model": model, "prompt": "Представься", "stream": False}
+    payload = {"model": model, "prompt": prompt, "stream": False}
 
     encoded_payload = json.dumps(payload).encode("utf-8")
     http_request = request.Request(
@@ -90,7 +89,79 @@ def llm_test() -> dict[str, str]:
             detail="LLM service did not return a response",
         )
 
-    return {"prompt": payload["prompt"], "response": llm_response}
+    return llm_response
+
+
+@app.get("/llmtest")
+def llm_test() -> dict[str, str]:
+    """Send a test prompt to the configured Ollama LLM service."""
+
+    prompt = "Представься"
+    llm_response = _call_llm(prompt)
+
+    return {"prompt": prompt, "response": llm_response}
+
+
+@app.post("/llm/purchases")
+def llm_analyse_purchases(file_content: bytes = Body(..., embed=False)) -> dict[str, object]:
+    """Analyse a purchases file with the LLM and return the JSON result."""
+
+    if not file_content:
+        raise HTTPException(status_code=400, detail="Файл пуст или не содержит данных")
+
+    try:
+        content = file_content.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise HTTPException(status_code=400, detail="Файл должен быть в кодировке UTF-8") from exc
+
+    cleaned_content = content.strip()
+    if not cleaned_content:
+        raise HTTPException(status_code=400, detail="Файл пуст или не содержит данных")
+
+    prompt = (
+        "Проанализируй таблицу закупок ниже. Верни только валидный JSON-объект, где "
+        "каждый ключ — точное наименование товара из таблицы (без порядковых номеров), "
+        "а значение — объект с полями \"цена\", \"количество\", \"сумма\". Значения полей "
+        "должны быть строками и полностью совпадать с исходными данными. Игнорируй строки "
+        "с итогами, НДС и прочей служебной информацией. Не добавляй пояснений и текста вне JSON.\n"
+        f"Таблица закупок:\n{cleaned_content}"
+    )
+
+    llm_response = _call_llm(prompt)
+
+    try:
+        parsed_response = json.loads(llm_response)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=502, detail="LLM service returned invalid JSON") from exc
+
+    if not isinstance(parsed_response, dict):
+        raise HTTPException(status_code=502, detail="LLM service returned invalid JSON structure")
+
+    validated_response: dict[str, dict[str, str]] = {}
+    for product_name, data in parsed_response.items():
+        if not isinstance(product_name, str) or not isinstance(data, dict):
+            raise HTTPException(status_code=502, detail="LLM service returned invalid JSON structure")
+
+        try:
+            price = data["цена"]
+            quantity = data["количество"]
+            total = data["сумма"]
+        except KeyError as exc:
+            raise HTTPException(status_code=502, detail="LLM service returned incomplete data") from exc
+
+        if not all(isinstance(value, str) and value for value in (price, quantity, total)):
+            raise HTTPException(status_code=502, detail="LLM service returned invalid field types")
+
+        validated_response[product_name] = {
+            "цена": price,
+            "количество": quantity,
+            "сумма": total,
+        }
+
+    if not validated_response:
+        raise HTTPException(status_code=502, detail="LLM service returned empty result")
+
+    return validated_response
 
 
 @app.post("/budget", response_model=BudgetResponse)
