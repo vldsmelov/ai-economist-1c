@@ -432,6 +432,22 @@ class BudgetManager:
         ]
         return AnalysisResult(allocations=allocations, summaries=summaries)
 
+    def categorise(self, description: str, *, category_hint: Optional[str] = None) -> tuple[Optional[str], Optional[str]]:
+        """Return the matching category name and keyword for a description."""
+
+        if not self._categories:
+            return None, None
+
+        purchase = PurchaseItem(
+            description=description,
+            amount=0.0,
+            category_hint=category_hint,
+        )
+        category, keyword = self._match_category(purchase)
+        if category is None:
+            return None, None
+        return category.name, keyword
+
     def _match_category(self, purchase: PurchaseItem) -> Tuple[Optional[BudgetCategory], Optional[str]]:
         if purchase.category_hint:
             hinted = self._categories.get(purchase.normalised_hint() or "")
