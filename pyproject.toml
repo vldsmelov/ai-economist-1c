@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ai-economist-service"
+version = "0.1.0"
+description = "Self-contained service for running AI Economist-style economic simulations"
+authors = [{name = "AI Economist Team", email = "team@example.com"}]
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.9"
+dependencies = [
+    "fastapi>=0.111.0",
+    "pydantic>=2.6.0",
+    "uvicorn>=0.30.0",
+    "numpy>=1.26",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "httpx>=0.27",
+]
+
+[tool.setuptools.packages.find]
+include = ["ai_economist_service*", "scripts"]
