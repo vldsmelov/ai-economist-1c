@@ -22,18 +22,24 @@
 ## Быстрый старт
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -e .[dev]
-uvicorn ai_economist_service.api.app:app --reload
+docker build -t ai-economist-service .
+docker run --rm -p 8000:8000 ai-economist-service
 ```
 
-После запуска сервиса отправьте POST-запрос на `/simulate`:
+После запуска контейнера сервис доступен по адресу `http://localhost:8000`.
+Для запуска эпизода отправьте POST-запрос на `/simulate`:
 
 ```bash
 curl -X POST http://localhost:8000/simulate \
   -H "Content-Type: application/json" \
   -d '{"steps": 20, "seed": 123}'
+```
+
+Для быстрого теста сервиса предусмотрен GET-запрос на `/simulate/test`, который
+возвращает результат короткого детерминированного эпизода:
+
+```bash
+curl http://localhost:8000/simulate/test
 ```
 
 ## Тестирование

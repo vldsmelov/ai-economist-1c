@@ -1,12 +1,16 @@
 """FastAPI application exposing the AI Economist simulation."""
 from __future__ import annotations
 
+from dataclasses import replace
+
 from fastapi import FastAPI
 
 from ..simulation import EpisodeResult, Simulation, SimulationConfig
 from .schemas import SimulationRequest, SimulationResponse, StepState
 
 app = FastAPI(title="AI Economist Service", version="0.1.0")
+
+_TEST_CONFIG = SimulationConfig(steps=5, num_agents=2, width=4, height=4, seed=42)
 
 
 def build_simulation(request: SimulationRequest) -> Simulation:
@@ -53,5 +57,14 @@ def health() -> dict[str, str]:
 @app.post("/simulate", response_model=SimulationResponse)
 def simulate(request: SimulationRequest) -> SimulationResponse:
     simulation = build_simulation(request)
+    episode = simulation.run_episode()
+    return format_episode(episode)
+
+
+@app.get("/simulate/test", response_model=SimulationResponse)
+def simulate_test() -> SimulationResponse:
+    """Run a deterministic short episode that mirrors the unit test scenario."""
+
+    simulation = Simulation(config=replace(_TEST_CONFIG))
     episode = simulation.run_episode()
     return format_episode(episode)
