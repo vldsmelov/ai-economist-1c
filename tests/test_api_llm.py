@@ -9,6 +9,7 @@ from typing import Any
 
 import pytest
 from fastapi import HTTPException
+from starlette.requests import Request
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if PROJECT_ROOT not in sys.path:
@@ -20,6 +21,11 @@ app_module = importlib.import_module("service.api.app")
 from service.api.app import llm_analyse_purchases, llm_test
 
 from urllib import error
+
+
+@pytest.fixture
+def anyio_backend() -> str:
+    return "asyncio"
 
 
 def test_llmtest_returns_response(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -62,7 +68,21 @@ def test_llmtest_handles_request_error(monkeypatch: pytest.MonkeyPatch) -> None:
     assert "Failed to reach LLM service" in str(excinfo.value)
 
 
-def test_llm_analyse_purchases_returns_json(monkeypatch: pytest.MonkeyPatch) -> None:
+def _build_request(body: bytes, content_type: str) -> Request:
+    scope = {
+        "type": "http",
+        "method": "POST",
+        "headers": [(b"content-type", content_type.encode("latin-1"))],
+    }
+
+    async def receive() -> dict[str, object]:
+        return {"type": "http.request", "body": body, "more_body": False}
+
+    return Request(scope, receive)
+
+
+@pytest.mark.anyio
+async def test_llm_analyse_purchases_returns_json(monkeypatch: pytest.MonkeyPatch) -> None:
     payload = {
         '17.3" Ноутбук ARDOR Gaming RAGE R17-I7ND405 черный': {
             "цена": "152 099,00",
@@ -124,12 +144,24 @@ def test_llm_analyse_purchases_returns_json(monkeypatch: pytest.MonkeyPatch) -> 
 202 602,67
 """.encode("utf-8")
 
-    result = llm_analyse_purchases(file_payload)
+    request = _build_request(
+        body=(
+            b"--boundary\r\n"
+            b"Content-Disposition: form-data; name=\"file\"; filename=\"purchases.txt\"\r\n"
+            b"Content-Type: text/plain\r\n\r\n"
+            + file_payload
+            + b"\r\n--boundary--\r\n"
+        ),
+        content_type="multipart/form-data; boundary=boundary",
+    )
+
+    result = await llm_analyse_purchases(request)
 
     assert result == payload
 
 
-def test_llm_analyse_purchases_invalid_json(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.anyio
+async def test_llm_analyse_purchases_invalid_json(monkeypatch: pytest.MonkeyPatch) -> None:
     def fake_urlopen(*_: Any, **__: Any):  # noqa: ANN401 - signature required
         class _FakeResponse:
             def __init__(self) -> None:
@@ -149,20 +181,37 @@ def test_llm_analyse_purchases_invalid_json(monkeypatch: pytest.MonkeyPatch) -> 
 
     monkeypatch.setattr(app_module.request, "urlopen", fake_urlopen)
 
+    request = _build_request(
+        body="товар 1, 2 шт".encode("utf-8"),
+        content_type="text/plain",
+    )
+
     with pytest.raises(HTTPException) as excinfo:
-        llm_analyse_purchases("товар 1, 2 шт".encode("utf-8"))
+        await llm_analyse_purchases(request)
 
     assert "invalid JSON" in str(excinfo.value)
 
 
-def test_llm_analyse_purchases_empty_file() -> None:
+@pytest.mark.anyio
+async def test_llm_analyse_purchases_empty_file() -> None:
+    request = _build_request(
+        body=(
+            b"--boundary\r\n"
+            b"Content-Disposition: form-data; name=\"file\"; filename=\"empty.txt\"\r\n"
+            b"Content-Type: text/plain\r\n\r\n   \r\n"
+            b"--boundary--\r\n"
+        ),
+        content_type="multipart/form-data; boundary=boundary",
+    )
+
     with pytest.raises(HTTPException) as excinfo:
-        llm_analyse_purchases(b"   ")
+        await llm_analyse_purchases(request)
 
     assert "Файл пуст" in str(excinfo.value)
 
 
-def test_llm_analyse_purchases_missing_fields(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.anyio
+async def test_llm_analyse_purchases_missing_fields(monkeypatch: pytest.MonkeyPatch) -> None:
     payload = {"товар": {"цена": "100", "количество": "1"}}
 
     def fake_urlopen(*_: Any, **__: Any):  # noqa: ANN401 - signature required
@@ -184,7 +233,12 @@ def test_llm_analyse_purchases_missing_fields(monkeypatch: pytest.MonkeyPatch) -
 
     monkeypatch.setattr(app_module.request, "urlopen", fake_urlopen)
 
+    request = _build_request(
+        body="товар, 1 шт".encode("utf-8"),
+        content_type="text/plain",
+    )
+
     with pytest.raises(HTTPException) as excinfo:
-        llm_analyse_purchases("товар, 1 шт".encode("utf-8"))
+        await llm_analyse_purchases(request)
 
     assert "incomplete data" in str(excinfo.value)

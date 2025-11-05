@@ -5,7 +5,7 @@ import json
 import os
 from urllib import error, request
 
-from fastapi import Body, FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 
 from ..budget import BudgetCategory, CategorySummary, PurchaseItem, budget_manager
 from .schemas import (
@@ -102,9 +102,56 @@ def llm_test() -> dict[str, str]:
     return {"prompt": prompt, "response": llm_response}
 
 
+def _extract_boundary(content_type: str) -> str | None:
+    for part in content_type.split(";"):
+        part = part.strip()
+        if part.startswith("boundary="):
+            boundary = part.split("=", 1)[1].strip()
+            if boundary.startswith("\"") and boundary.endswith("\""):
+                boundary = boundary[1:-1]
+            return boundary
+    return None
+
+
+def _parse_multipart_file(body: bytes, boundary: str) -> bytes:
+    delimiter = f"--{boundary}".encode()
+    sections = body.split(delimiter)
+
+    for section in sections:
+        section = section.strip(b"\r\n")
+        if not section or section in {b"--", b"--\r\n"}:
+            continue
+
+        if section.endswith(b"--"):
+            section = section[:-2]
+
+        header_sep = b"\r\n\r\n"
+        if header_sep not in section:
+            header_sep = b"\n\n"
+
+        _, _, data = section.partition(header_sep)
+        if not data:
+            continue
+
+        return data.rstrip(b"\r\n")
+
+    raise HTTPException(status_code=400, detail="Не удалось прочитать файл из формы")
+
+
 @app.post("/llm/purchases")
-def llm_analyse_purchases(file_content: bytes = Body(..., embed=False)) -> dict[str, object]:
+async def llm_analyse_purchases(request: Request) -> dict[str, object]:
     """Analyse a purchases file with the LLM and return the JSON result."""
+
+    body = await request.body()
+
+    content_type = request.headers.get("content-type", "")
+    if "multipart/form-data" in content_type.lower():
+        boundary = _extract_boundary(content_type)
+        if not boundary:
+            raise HTTPException(status_code=400, detail="Граница multipart-запроса не найдена")
+        file_content = _parse_multipart_file(body, boundary)
+    else:
+        file_content = body
 
     if not file_content:
         raise HTTPException(status_code=400, detail="Файл пуст или не содержит данных")
