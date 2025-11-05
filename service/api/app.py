@@ -183,7 +183,7 @@ async def llm_analyse_purchases(request: Request) -> dict[str, object]:
     if not isinstance(parsed_response, dict):
         raise HTTPException(status_code=502, detail="LLM service returned invalid JSON structure")
 
-    validated_response: dict[str, dict[str, str]] = {}
+    validated_response: dict[str, dict[str, object]] = {}
     for product_name, data in parsed_response.items():
         if not isinstance(product_name, str) or not isinstance(data, dict):
             raise HTTPException(status_code=502, detail="LLM service returned invalid JSON structure")
@@ -198,10 +198,13 @@ async def llm_analyse_purchases(request: Request) -> dict[str, object]:
         if not all(isinstance(value, str) and value for value in (price, quantity, total)):
             raise HTTPException(status_code=502, detail="LLM service returned invalid field types")
 
+        category_name, _ = budget_manager.categorise(product_name)
+
         validated_response[product_name] = {
             "цена": price,
             "количество": quantity,
             "сумма": total,
+            "категория": category_name,
         }
 
     if not validated_response:
