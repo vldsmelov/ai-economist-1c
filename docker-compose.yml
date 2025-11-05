@@ -1,5 +1,3 @@
-version: "3.9"
-
 services:
   service:
     build: .
@@ -47,7 +45,7 @@ services:
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
     volumes:
       - ollama:/root/.ollama
-    command: ["ollama", "pull", "krith/qwen2.5-32b-instruct:IQ4_XS"]
+    command: ["pull", "krith/qwen2.5-32b-instruct:IQ4_XS"]
     restart: "no"
 
 volumes:
