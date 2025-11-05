@@ -7,11 +7,10 @@ from urllib import error, request
 
 from fastapi import FastAPI, HTTPException, Request
 
-from ..budget import BudgetCategory, CategorySummary, PurchaseItem, budget_manager
+from ..budget import CategorySummary, PurchaseItem, budget_manager, parse_budget_csv
 from .schemas import (
     BudgetCategoryResponse,
     BudgetResponse,
-    BudgetUploadRequest,
     CategorySummaryResponse,
     PurchaseAnalysisResponse,
     PurchaseAllocationResponse,
@@ -212,11 +211,26 @@ async def llm_analyse_purchases(request: Request) -> dict[str, object]:
 
 
 @app.post("/budget", response_model=BudgetResponse)
-def upload_budget(request: BudgetUploadRequest) -> BudgetResponse:
-    categories = [
-        BudgetCategory(name=row.category, limit=row.limit, keywords=row.keywords)
-        for row in request.rows
-    ]
+async def upload_budget(request: Request) -> BudgetResponse:
+    body = await request.body()
+
+    content_type = request.headers.get("content-type", "")
+    if "multipart/form-data" in content_type.lower():
+        boundary = _extract_boundary(content_type)
+        if not boundary:
+            raise HTTPException(status_code=400, detail="Граница multipart-запроса не найдена")
+        file_content = _parse_multipart_file(body, boundary)
+    else:
+        file_content = body
+
+    if not file_content:
+        raise HTTPException(status_code=400, detail="Файл пуст или не содержит данных")
+
+    try:
+        categories = parse_budget_csv(file_content, call_llm=_call_llm)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     budget_manager.load_budget(categories)
     return _build_budget_response()
 
