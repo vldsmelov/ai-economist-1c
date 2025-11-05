@@ -1,6 +1,10 @@
 """FastAPI application exposing budgeting capabilities for the economist service."""
 from __future__ import annotations
 
+import json
+import os
+from urllib import error, request
+
 from fastapi import FastAPI, HTTPException
 
 from ..budget import BudgetCategory, CategorySummary, PurchaseItem, budget_manager
@@ -44,6 +48,49 @@ def _summary_to_schema(summary: CategorySummary) -> CategorySummaryResponse:
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.get("/llmtest")
+def llm_test() -> dict[str, str]:
+    """Send a test prompt to the configured Ollama LLM service."""
+
+    host = os.getenv("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
+    model = os.getenv("OLLAMA_MODEL", "llama3")
+    url = f"{host}/api/generate"
+    payload = {"model": model, "prompt": "Представься", "stream": False}
+
+    encoded_payload = json.dumps(payload).encode("utf-8")
+    http_request = request.Request(
+        url,
+        data=encoded_payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+
+    try:
+        with request.urlopen(http_request, timeout=30.0) as http_response:
+            body = http_response.read().decode("utf-8")
+            data = json.loads(body)
+    except error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="ignore")
+        raise HTTPException(
+            status_code=502,
+            detail=f"LLM service returned error: {detail or exc.reason}",
+        ) from exc
+    except error.URLError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Failed to reach LLM service: {exc.reason}",
+        ) from exc
+
+    llm_response = data.get("response") or data.get("message")
+    if not llm_response:
+        raise HTTPException(
+            status_code=502,
+            detail="LLM service did not return a response",
+        )
+
+    return {"prompt": payload["prompt"], "response": llm_response}
 
 
 @app.post("/budget", response_model=BudgetResponse)
