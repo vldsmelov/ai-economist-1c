@@ -7,7 +7,13 @@ from urllib import error, request
 
 from fastapi import FastAPI, HTTPException, Request
 
-from ..budget import CategorySummary, PurchaseItem, budget_manager, parse_budget_csv
+from ..budget import (
+    CategorySummary,
+    PurchaseItem,
+    _normalise_number,
+    budget_manager,
+    parse_budget_csv,
+)
 from .schemas import (
     BudgetCategoryResponse,
     BudgetResponse,
@@ -212,6 +218,10 @@ async def llm_analyse_purchases(request: Request) -> dict[str, object]:
     known_categories = {
         category.normalised_name(): category.name for category in budget_categories
     }
+    category_limits_by_name = {category.name: category.limit for category in budget_categories}
+    category_limits_by_normalised = {
+        category.normalised_name(): category.limit for category in budget_categories
+    }
     validated_response: dict[str, dict[str, object]] = {}
     for product_name, data in parsed_response.items():
         if not isinstance(product_name, str) or not isinstance(data, dict):
@@ -251,7 +261,56 @@ async def llm_analyse_purchases(request: Request) -> dict[str, object]:
     if not validated_response:
         raise HTTPException(status_code=502, detail="LLM service returned empty result")
 
-    return validated_response
+    def format_number(value: float | None) -> str:
+        if value is None:
+            return ""
+        rounded = round(value)
+        if abs(value - rounded) < 1e-6:
+            return str(int(rounded))
+        return (f"{value:.2f}").rstrip("0").rstrip(".")
+
+    summary: dict[str, dict[str, object]] = {}
+    totals: dict[str, float] = {}
+
+    for product_name, data in validated_response.items():
+        category_name = data["категория"]
+        category_key = category_name if category_name is not None else "null"
+        summary.setdefault(
+            category_key,
+            {
+                "товары": [],
+                "доступный_бюджет": "",
+                "необходимая_сумма": 0.0,
+                "достаточно": "Неизвестно",
+            },
+        )
+        summary[category_key]["товары"].append(product_name)
+        totals[category_key] = totals.get(category_key, 0.0) + _normalise_number(
+            data["сумма"]
+        )
+
+    for category_key, details in summary.items():
+        required_total = totals.get(category_key, 0.0)
+        category_name = None if category_key == "null" else category_key
+        available_limit: float | None = None
+        if category_name is not None:
+            available_limit = category_limits_by_name.get(category_name)
+            if available_limit is None:
+                available_limit = category_limits_by_normalised.get(
+                    category_name.strip().lower()
+                )
+
+        details["необходимая_сумма"] = format_number(required_total)
+        details["доступный_бюджет"] = format_number(available_limit)
+
+        if category_name is None or available_limit is None:
+            details["достаточно"] = "Неизвестно"
+        else:
+            details["достаточно"] = (
+                "Да" if required_total <= available_limit else "Нет"
+            )
+
+    return summary
 
 
 @app.post("/budget", response_model=BudgetResponse)
