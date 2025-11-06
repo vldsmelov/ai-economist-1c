@@ -88,11 +88,13 @@ async def test_llm_analyse_purchases_returns_json(monkeypatch: pytest.MonkeyPatc
             "цена": "152 099,00",
             "количество": "6",
             "сумма": "912 594,00",
+            "категория": "Оргтехника",
         },
         "Холодильник ACELINE B16AMG белый": {
             "цена": "24 699,00",
             "количество": "1",
             "сумма": "24 699,00",
+            "категория": "Бытовая техника",
         },
     }
 
@@ -114,6 +116,7 @@ async def test_llm_analyse_purchases_returns_json(monkeypatch: pytest.MonkeyPatc
         return _ContextManager()
 
     monkeypatch.setattr(app_module.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(app_module.budget_manager, "categories", lambda: [])
 
     file_payload = """
 Наименование и характеристика Товара
@@ -157,7 +160,146 @@ async def test_llm_analyse_purchases_returns_json(monkeypatch: pytest.MonkeyPatc
 
     result = await llm_analyse_purchases(request)
 
-    assert result == payload
+    expected = {
+        name: {**values, "категория": None}
+        for name, values in payload.items()
+    }
+
+    assert result == expected
+
+
+@pytest.mark.anyio
+async def test_llm_analyse_purchases_includes_categories(monkeypatch: pytest.MonkeyPatch) -> None:
+    payload = {
+        '17.3" Ноутбук ARDOR Gaming RAGE R17-I7ND405 черный': {
+            "цена": "152 099,00",
+            "количество": "6",
+            "сумма": "912 594,00",
+        },
+        "Ноутбук ASUS TUF Gaming A17 FA706NFR-HX017 черный": {
+            "цена": "90 998,00",
+            "количество": "3",
+            "сумма": "272 994,00",
+        },
+    }
+
+    def fake_urlopen(*_: Any, **__: Any):  # noqa: ANN401 - signature required
+        class _FakeResponse:
+            def __init__(self) -> None:
+                self._data = json.dumps({"response": json.dumps(payload)}).encode("utf-8")
+
+            def read(self) -> bytes:
+                return self._data
+
+        class _ContextManager:
+            def __enter__(self) -> _FakeResponse:
+                return _FakeResponse()
+
+            def __exit__(self, *_: object) -> None:
+                return None
+
+        return _ContextManager()
+
+    def fake_categorise(description: str) -> tuple[str | None, str | None]:
+        if "TUF Gaming" in description:
+            return "Оргтехника", "keyword"
+        return None, None
+
+    monkeypatch.setattr(app_module.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(app_module.budget_manager, "categorise", fake_categorise)
+
+    request = _build_request(
+        body="""Товар;Количество;Цена;Сумма
+17.3\" Ноутбук ARDOR Gaming RAGE R17-I7ND405 черный;6;152 099,00;912 594,00
+Ноутбук ASUS TUF Gaming A17 FA706NFR-HX017 черный;3;90 998,00;272 994,00
+""".encode("utf-8"),
+        content_type="text/plain",
+    )
+
+    result = await llm_analyse_purchases(request)
+
+    assert result == {
+        '17.3" Ноутбук ARDOR Gaming RAGE R17-I7ND405 черный': {
+            "цена": "152 099,00",
+            "количество": "6",
+            "сумма": "912 594,00",
+            "категория": None,
+        },
+        "Ноутбук ASUS TUF Gaming A17 FA706NFR-HX017 черный": {
+            "цена": "90 998,00",
+            "количество": "3",
+            "сумма": "272 994,00",
+            "категория": "Оргтехника",
+        },
+    }
+
+
+@pytest.mark.anyio
+async def test_llm_analyse_purchases_includes_categories(monkeypatch: pytest.MonkeyPatch) -> None:
+    payload = {
+        '17.3" Ноутбук ARDOR Gaming RAGE R17-I7ND405 черный': {
+            "цена": "152 099,00",
+            "количество": "6",
+            "сумма": "912 594,00",
+            "категория": "Оргтехника",
+        },
+        "Ноутбук ASUS TUF Gaming A17 FA706NFR-HX017 черный": {
+            "цена": "90 998,00",
+            "количество": "3",
+            "сумма": "272 994,00",
+        },
+    }
+
+    def fake_urlopen(*_: Any, **__: Any):  # noqa: ANN401 - signature required
+        class _FakeResponse:
+            def __init__(self) -> None:
+                self._data = json.dumps({"response": json.dumps(payload)}).encode("utf-8")
+
+            def read(self) -> bytes:
+                return self._data
+
+        class _ContextManager:
+            def __enter__(self) -> _FakeResponse:
+                return _FakeResponse()
+
+            def __exit__(self, *_: object) -> None:
+                return None
+
+        return _ContextManager()
+
+    def fake_categorise(description: str) -> tuple[str | None, str | None]:
+        if "TUF Gaming" in description:
+            return "Оргтехника", "keyword"
+        return None, None
+
+    monkeypatch.setattr(app_module.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(app_module.budget_manager, "categorise", fake_categorise)
+    monkeypatch.setattr(app_module.budget_manager, "categories", lambda: [])
+
+    request = _build_request(
+        body="""Товар;Количество;Цена;Сумма
+17.3\" Ноутбук ARDOR Gaming RAGE R17-I7ND405 черный;6;152 099,00;912 594,00
+Ноутбук ASUS TUF Gaming A17 FA706NFR-HX017 черный;3;90 998,00;272 994,00
+""".encode("utf-8"),
+        content_type="text/plain",
+    )
+
+    result = await llm_analyse_purchases(request)
+
+    assert result == {
+        '17.3" Ноутбук ARDOR Gaming RAGE R17-I7ND405 черный': {
+            "цена": "152 099,00",
+            "количество": "6",
+            "сумма": "912 594,00",
+            "категория": "Оргтехника",
+        },
+        "Ноутбук ASUS TUF Gaming A17 FA706NFR-HX017 черный": {
+            "цена": "90 998,00",
+            "количество": "3",
+            "сумма": "272 994,00",
+            "категория": "Оргтехника",
+        },
+    }
 
 
 @pytest.mark.anyio

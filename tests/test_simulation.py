@@ -1,3 +1,4 @@
+import json
 import os
 import sys
 
@@ -30,19 +31,54 @@ def client() -> TestClient:
     return TestClient(app)
 
 
-def test_upload_and_get_budget(client: TestClient):
-    payload = {
-        "rows": [
-            {"category": "Электроника", "limit": 2_000_000, "keywords": ["электроника", "ноутбук"]},
-            {"category": "Крупная бытовая техника", "limit": 5_215_000, "keywords": ["холодильник"]},
-        ]
+def _mock_budget_llm(monkeypatch: pytest.MonkeyPatch) -> None:
+    response = {
+        "Электроника": "2 000 000,00",
+        "Крупная бытовая техника": "5 215 000,00",
+        "Оргтехника": "600 000,00",
+        "Материалы": "103 398,25",
     }
 
-    response = client.post("/budget", json=payload)
+    def _fake_call_llm(prompt: str) -> str:  # pragma: no cover - executed in tests only
+        return json.dumps(response, ensure_ascii=False)
+
+    monkeypatch.setattr("service.api.app._call_llm", _fake_call_llm)
+
+
+def _build_budget_csv() -> str:
+    return "\n".join(
+        [
+            "Период планирования;2025",
+            "Организация;ООО \"Пример\"",
+            "Счет бюджета;Основной",
+            "Товарная категория;Использовано;Корректировка;Согласованный лимит;Зарезервировано;Фактическая оплата;Плановая оплата;Доступно;Ключевые слова",
+            "Электроника;0;0;2 000 000,00;0;0;0;2 000 000,00;электроника, ноутбук",
+            "Крупная бытовая техника;0;0;5 215 000,00;0;0;0;5 215 000,00;холодильник",
+            "Оргтехника;0;0;600 000,00;0;0;0;600 000,00;оргтехника, принтер",
+            "Материалы;0;0;103 398,25;0;0;0;103 398,25;",
+            "Итого;0;0;7 918 398,25;0;0;0;7 918 398,25;",
+        ]
+    )
+
+
+def test_upload_and_get_budget(client: TestClient, monkeypatch: pytest.MonkeyPatch):
+    _mock_budget_llm(monkeypatch)
+    csv_content = _build_budget_csv()
+
+    response = client.post(
+        "/budget",
+        files={"file": ("budget.csv", csv_content.encode("utf-8"), "text/csv")},
+    )
     assert response.status_code == 200
     data = response.json()
-    assert data["total_limit"] == pytest.approx(7_215_000)
-    assert len(data["categories"]) == 2
+    assert data["total_limit"] == pytest.approx(7_918_398.25)
+    assert len(data["categories"]) == 4
+
+    categories = {row["category"]: row for row in data["categories"]}
+    assert categories["Электроника"]["limit"] == pytest.approx(2_000_000)
+    assert categories["Электроника"]["keywords"] == ["электроника", "ноутбук"]
+    assert categories["Материалы"]["limit"] == pytest.approx(103_398.25)
+    assert categories["Материалы"]["keywords"] == []
 
     response_get = client.get("/budget")
     assert response_get.status_code == 200
@@ -50,15 +86,13 @@ def test_upload_and_get_budget(client: TestClient):
     assert data_get == data
 
 
-def test_analyse_purchases(client: TestClient):
-    budget_payload = {
-        "rows": [
-            {"category": "Электроника", "limit": 2_000_000, "keywords": ["электроника", "ноутбук"]},
-            {"category": "Крупная бытовая техника", "limit": 5_215_000, "keywords": ["холодильник", "бытовая техника"]},
-            {"category": "Оргтехника", "limit": 600_000, "keywords": ["оргтехника", "принтер"]},
-        ]
-    }
-    client.post("/budget", json=budget_payload)
+def test_analyse_purchases(client: TestClient, monkeypatch: pytest.MonkeyPatch):
+    _mock_budget_llm(monkeypatch)
+    csv_content = _build_budget_csv()
+    client.post(
+        "/budget",
+        files={"file": ("budget.csv", csv_content.encode("utf-8"), "text/csv")},
+    )
 
     purchases_payload = {
         "purchases": [
