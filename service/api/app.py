@@ -209,11 +209,23 @@ async def llm_analyse_purchases(request: Request) -> dict[str, object]:
 
     try:
         parsed_response = json.loads(llm_response)
-    except json.JSONDecodeError as exc:
-        raise HTTPException(status_code=502, detail="LLM service returned invalid JSON") from exc
+    except json.JSONDecodeError:
+        return {
+            "LLM": {
+                "error": "LLM service returned invalid JSON",
+                "raw_response": llm_response,
+            },
+            "budget": {},
+        }
 
     if not isinstance(parsed_response, dict):
-        raise HTTPException(status_code=502, detail="LLM service returned invalid JSON structure")
+        return {
+            "LLM": {
+                "error": "LLM service returned invalid JSON structure",
+                "raw_response": llm_response,
+            },
+            "budget": {},
+        }
 
     known_categories = {
         category.normalised_name(): category.name for category in budget_categories
@@ -223,43 +235,54 @@ async def llm_analyse_purchases(request: Request) -> dict[str, object]:
         category.normalised_name(): category.limit for category in budget_categories
     }
     validated_response: dict[str, dict[str, object]] = {}
-    for product_name, data in parsed_response.items():
-        if not isinstance(product_name, str) or not isinstance(data, dict):
-            raise HTTPException(status_code=502, detail="LLM service returned invalid JSON structure")
+    try:
+        for product_name, data in parsed_response.items():
+            if not isinstance(product_name, str) or not isinstance(data, dict):
+                raise ValueError("LLM service returned invalid JSON structure")
 
-        try:
-            price = data["цена"]
-            quantity = data["количество"]
-            total = data["сумма"]
-        except KeyError as exc:
-            raise HTTPException(status_code=502, detail="LLM service returned incomplete data") from exc
+            try:
+                price = data["цена"]
+                quantity = data["количество"]
+                total = data["сумма"]
+            except KeyError as exc:
+                raise ValueError("LLM service returned incomplete data") from exc
 
-        if not all(isinstance(value, str) and value for value in (price, quantity, total)):
-            raise HTTPException(status_code=502, detail="LLM service returned invalid field types")
+            if not all(isinstance(value, str) and value for value in (price, quantity, total)):
+                raise ValueError("LLM service returned invalid field types")
 
-        category_value = data.get("категория")
-        if category_value is not None and not isinstance(category_value, str):
-            raise HTTPException(status_code=502, detail="LLM service returned invalid category field")
+            category_value = data.get("категория")
+            if category_value is not None and not isinstance(category_value, str):
+                raise ValueError("LLM service returned invalid category field")
 
-        category_name: str | None = None
-        if isinstance(category_value, str):
-            stripped_category = category_value.strip()
-            if stripped_category:
-                category_name = known_categories.get(stripped_category.lower(), stripped_category)
+            category_name: str | None = None
+            if isinstance(category_value, str):
+                stripped_category = category_value.strip()
+                if stripped_category:
+                    category_name = known_categories.get(
+                        stripped_category.lower(), stripped_category
+                    )
 
-        if category_name is None:
-            auto_category, _ = budget_manager.categorise(product_name)
-            category_name = auto_category
+            if category_name is None:
+                auto_category, _ = budget_manager.categorise(product_name)
+                category_name = auto_category
 
-        validated_response[product_name] = {
-            "цена": price,
-            "количество": quantity,
-            "сумма": total,
-            "категория": category_name,
+            validated_response[product_name] = {
+                "цена": price,
+                "количество": quantity,
+                "сумма": total,
+                "категория": category_name,
+            }
+    except ValueError as exc:
+        return {
+            "LLM": parsed_response,
+            "budget": {"error": str(exc)},
         }
 
     if not validated_response:
-        raise HTTPException(status_code=502, detail="LLM service returned empty result")
+        return {
+            "LLM": parsed_response,
+            "budget": {"error": "LLM service returned empty result"},
+        }
 
     def format_number(value: float | None) -> str:
         if value is None:
@@ -310,7 +333,7 @@ async def llm_analyse_purchases(request: Request) -> dict[str, object]:
                 "Да" if required_total <= available_limit else "Нет"
             )
 
-    return summary
+    return {"LLM": parsed_response, "budget": summary}
 
 
 @app.post("/budget", response_model=BudgetResponse)
