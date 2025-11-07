@@ -162,20 +162,17 @@ async def test_llm_analyse_purchases_groups_by_category(monkeypatch: pytest.Monk
     result = await llm_analyse_purchases(request)
 
     assert result == {
-        "LLM": payload,
-        "budget": {
-            "Оргтехника": {
-                "товары": ['17.3" Ноутбук ARDOR Gaming RAGE R17-I7ND405 черный'],
-                "доступный_бюджет": "",
-                "необходимая_сумма": "912594",
-                "достаточно": "Неизвестно",
-            },
-            "Бытовая техника": {
-                "товары": ["Холодильник ACELINE B16AMG белый"],
-                "доступный_бюджет": "",
-                "необходимая_сумма": "24699",
-                "достаточно": "Неизвестно",
-            },
+        "Оргтехника": {
+            "товары": ['17.3" Ноутбук ARDOR Gaming RAGE R17-I7ND405 черный'],
+            "доступный_бюджет": "",
+            "необходимая_сумма": "912594",
+            "достаточно": "Неизвестно",
+        },
+        "Бытовая техника": {
+            "товары": ["Холодильник ACELINE B16AMG белый"],
+            "доступный_бюджет": "",
+            "необходимая_сумма": "24699",
+            "достаточно": "Неизвестно",
         },
     }
 
@@ -237,18 +234,15 @@ async def test_llm_analyse_purchases_uses_budget_limits(monkeypatch: pytest.Monk
     result = await llm_analyse_purchases(request)
 
     assert result == {
-        "LLM": payload,
-        "budget": {
-            "Оргтехника": {
-                "товары": [
-                    '17.3" Ноутбук ARDOR Gaming RAGE R17-I7ND405 черный',
-                    "Ноутбук ASUS TUF Gaming A17 FA706NFR-HX017 черный",
-                ],
-                "доступный_бюджет": "2000000",
-                "необходимая_сумма": "1185588",
-                "достаточно": "Да",
-            }
-        },
+        "Оргтехника": {
+            "товары": [
+                '17.3" Ноутбук ARDOR Gaming RAGE R17-I7ND405 черный',
+                "Ноутбук ASUS TUF Gaming A17 FA706NFR-HX017 черный",
+            ],
+            "доступный_бюджет": "2000000",
+            "необходимая_сумма": "1185588",
+            "достаточно": "Да",
+        }
     }
 
 
@@ -293,15 +287,12 @@ async def test_llm_analyse_purchases_groups_null_category(monkeypatch: pytest.Mo
     result = await llm_analyse_purchases(request)
 
     assert result == {
-        "LLM": payload,
-        "budget": {
-            "null": {
-                "товары": ["Электрочайник Polaris PWK"],
-                "доступный_бюджет": "",
-                "необходимая_сумма": "5329",
-                "достаточно": "Неизвестно",
-            }
-        },
+        "null": {
+            "товары": ["Электрочайник Polaris PWK"],
+            "доступный_бюджет": "",
+            "необходимая_сумма": "5329",
+            "достаточно": "Неизвестно",
+        }
     }
 
 
@@ -331,15 +322,11 @@ async def test_llm_analyse_purchases_invalid_json(monkeypatch: pytest.MonkeyPatc
         content_type="text/plain",
     )
 
-    result = await llm_analyse_purchases(request)
+    with pytest.raises(HTTPException) as excinfo:
+        await llm_analyse_purchases(request)
 
-    assert result == {
-        "LLM": {
-            "error": "LLM service returned invalid JSON",
-            "raw_response": "not-json",
-        },
-        "budget": {},
-    }
+    assert excinfo.value.status_code == 502
+    assert "не содержит корректный JSON" in str(excinfo.value)
 
 
 @pytest.mark.anyio
@@ -388,9 +375,8 @@ async def test_llm_analyse_purchases_missing_fields(monkeypatch: pytest.MonkeyPa
         content_type="text/plain",
     )
 
-    result = await llm_analyse_purchases(request)
+    with pytest.raises(HTTPException) as excinfo:
+        await llm_analyse_purchases(request)
 
-    assert result == {
-        "LLM": payload,
-        "budget": {"error": "LLM service returned incomplete data"},
-    }
+    assert excinfo.value.status_code == 502
+    assert "неполные данные" in str(excinfo.value)
