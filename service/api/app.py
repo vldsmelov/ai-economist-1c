@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+from typing import Any
 from urllib import error, request
 
 from fastapi import FastAPI, HTTPException, Request
@@ -95,6 +96,61 @@ def _call_llm(prompt: str) -> str:
         )
 
     return llm_response
+
+
+def _strip_code_fence(text: str) -> str:
+    """Remove optional Markdown code fences from an LLM response."""
+
+    stripped = text.strip()
+    if not stripped.startswith("```"):
+        return stripped
+
+    # Remove the opening fence and optional language hint.
+    stripped = stripped[3:].lstrip()
+    if stripped.lower().startswith("json"):
+        stripped = stripped[4:].lstrip()
+
+    closing_index = stripped.rfind("```")
+    if closing_index != -1:
+        stripped = stripped[:closing_index]
+
+    return stripped.strip()
+
+
+def _extract_json_object(text: str) -> dict[str, Any]:
+    """Extract a JSON object from arbitrary LLM output."""
+
+    cleaned = _strip_code_fence(text)
+
+    try:
+        parsed = json.loads(cleaned)
+    except json.JSONDecodeError:
+        parsed = None
+
+    if isinstance(parsed, dict):
+        return parsed
+
+    decoder = json.JSONDecoder()
+    idx = 0
+    length = len(cleaned)
+
+    while idx < length:
+        brace_index = cleaned.find("{", idx)
+        if brace_index == -1:
+            break
+
+        try:
+            parsed_fragment, offset = decoder.raw_decode(cleaned[brace_index:])
+        except json.JSONDecodeError:
+            idx = brace_index + 1
+            continue
+
+        if isinstance(parsed_fragment, dict):
+            return parsed_fragment
+
+        idx = brace_index + offset
+
+    raise ValueError("Ответ LLM не содержит корректный JSON-объект")
 
 
 @app.get("/llmtest")
@@ -192,12 +248,12 @@ async def llm_analyse_purchases(request: Request) -> dict[str, object]:
         )
 
     prompt = (
-        "Проанализируй таблицу закупок ниже. Верни только валидный JSON-объект, где "
-        "каждый ключ — точное наименование товара из таблицы (без порядковых номеров), "
-        "а значение — объект с полями \"цена\", \"количество\", \"сумма\", \"категория\". Значения "
-        "полей \"цена\", \"количество\" и \"сумма\" должны быть строками и полностью совпадать с исходными "
-        "данными. Игнорируй строки с итогами, НДС и прочей служебной информацией. Не добавляй "
-        "пояснений и текста вне JSON. "
+        "Проанализируй таблицу закупок ниже. Ответ должен содержать только один валидный JSON-объект "
+        "без дополнительных комментариев, текста и Markdown-оформления. Каждый ключ — точное "
+        "наименование товара из таблицы (без порядковых номеров), а значение — объект с полями \"цена\", "
+        "\"количество\", \"сумма\", \"категория\". Значения полей \"цена\", \"количество\" и \"сумма\" должны быть строками "
+        "и полностью совпадать с исходными данными. Игнорируй строки с итогами, НДС и прочей служебной "
+        "информацией. Не заключай ответ в тройные кавычки или иные разделители. "
         + categories_instruction
         + "\n\nКатегории бюджета (JSON):\n"
         + categories_json
@@ -208,24 +264,9 @@ async def llm_analyse_purchases(request: Request) -> dict[str, object]:
     llm_response = _call_llm(prompt)
 
     try:
-        parsed_response = json.loads(llm_response)
-    except json.JSONDecodeError:
-        return {
-            "LLM": {
-                "error": "LLM service returned invalid JSON",
-                "raw_response": llm_response,
-            },
-            "budget": {},
-        }
-
-    if not isinstance(parsed_response, dict):
-        return {
-            "LLM": {
-                "error": "LLM service returned invalid JSON structure",
-                "raw_response": llm_response,
-            },
-            "budget": {},
-        }
+        parsed_response = _extract_json_object(llm_response)
+    except ValueError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
 
     known_categories = {
         category.normalised_name(): category.name for category in budget_categories
@@ -235,54 +276,60 @@ async def llm_analyse_purchases(request: Request) -> dict[str, object]:
         category.normalised_name(): category.limit for category in budget_categories
     }
     validated_response: dict[str, dict[str, object]] = {}
-    try:
-        for product_name, data in parsed_response.items():
-            if not isinstance(product_name, str) or not isinstance(data, dict):
-                raise ValueError("LLM service returned invalid JSON structure")
+    for product_name, data in parsed_response.items():
+        if not isinstance(product_name, str) or not isinstance(data, dict):
+            raise HTTPException(
+                status_code=502,
+                detail="Ответ LLM содержит некорректную структуру данных",
+            )
 
-            try:
-                price = data["цена"]
-                quantity = data["количество"]
-                total = data["сумма"]
-            except KeyError as exc:
-                raise ValueError("LLM service returned incomplete data") from exc
+        try:
+            price = data["цена"]
+            quantity = data["количество"]
+            total = data["сумма"]
+        except KeyError as exc:
+            raise HTTPException(
+                status_code=502,
+                detail="Ответ LLM содержит неполные данные о покупках",
+            ) from exc
 
-            if not all(isinstance(value, str) and value for value in (price, quantity, total)):
-                raise ValueError("LLM service returned invalid field types")
+        if not all(isinstance(value, str) and value for value in (price, quantity, total)):
+            raise HTTPException(
+                status_code=502,
+                detail="Ответ LLM содержит значения в неверном формате",
+            )
 
-            category_value = data.get("категория")
-            if category_value is not None and not isinstance(category_value, str):
-                raise ValueError("LLM service returned invalid category field")
+        category_value = data.get("категория")
+        if category_value is not None and not isinstance(category_value, str):
+            raise HTTPException(
+                status_code=502,
+                detail="Ответ LLM содержит некорректное значение категории",
+            )
 
-            category_name: str | None = None
-            if isinstance(category_value, str):
-                stripped_category = category_value.strip()
-                if stripped_category:
-                    category_name = known_categories.get(
-                        stripped_category.lower(), stripped_category
-                    )
+        category_name: str | None = None
+        if isinstance(category_value, str):
+            stripped_category = category_value.strip()
+            if stripped_category:
+                category_name = known_categories.get(
+                    stripped_category.lower(), stripped_category
+                )
 
-            if category_name is None:
-                auto_category, _ = budget_manager.categorise(product_name)
-                category_name = auto_category
+        if category_name is None:
+            auto_category, _ = budget_manager.categorise(product_name)
+            category_name = auto_category
 
-            validated_response[product_name] = {
-                "цена": price,
-                "количество": quantity,
-                "сумма": total,
-                "категория": category_name,
-            }
-    except ValueError as exc:
-        return {
-            "LLM": parsed_response,
-            "budget": {"error": str(exc)},
+        validated_response[product_name] = {
+            "цена": price,
+            "количество": quantity,
+            "сумма": total,
+            "категория": category_name,
         }
 
     if not validated_response:
-        return {
-            "LLM": parsed_response,
-            "budget": {"error": "LLM service returned empty result"},
-        }
+        raise HTTPException(
+            status_code=502,
+            detail="Ответ LLM не содержит данных о покупках",
+        )
 
     def format_number(value: float | None) -> str:
         if value is None:
@@ -333,7 +380,7 @@ async def llm_analyse_purchases(request: Request) -> dict[str, object]:
                 "Да" if required_total <= available_limit else "Нет"
             )
 
-    return {"LLM": parsed_response, "budget": summary}
+    return summary
 
 
 @app.post("/budget", response_model=BudgetResponse)
