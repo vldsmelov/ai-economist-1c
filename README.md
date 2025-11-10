@@ -26,10 +26,64 @@
 
 ## Быстрый старт
 
-1. Соберите и поднимите сервис:
+1. Убедитесь, что Ollama запущен отдельно от этого проекта и доступен по
+   адресу `http://localhost:11434` (например, при помощи сервиса из примера
+   ниже). Сервис FastAPI обращается к Ollama через переменную окружения
+   `OLLAMA_HOST`.
+2. Соберите и поднимите сервис:
 
 После сборки сервис доступен по адресу `http://localhost:8081`. FastAPI
 документация будет доступна на `http://localhost:8081/docs`.
+
+### Отдельный сервис Ollama
+
+Пример docker-compose для запуска Ollama с моделью:
+
+```yaml
+services:
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    depends_on:
+      gpu-check:
+        condition: service_completed_successfully
+    ports:
+      - "11434:11434"
+    environment:
+      - OLLAMA_ORIGINS=*
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+    volumes:
+      - ollama:/root/.ollama
+    gpus: all
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+
+  init-model:
+    image: ollama/ollama:latest
+    depends_on:
+      ollama:
+        condition: service_healthy
+    environment:
+      - OLLAMA_HOST=http://ollama:11434
+    command: ["/bin/sh","-lc","ollama pull krith/qwen2.5-32b-instruct:IQ4_XS"]
+    restart: "no"
+
+volumes:
+  ollama:
+```
+
+В примере предполагается, что сервис `gpu-check` уже описан в том же файле и
+проверяет доступность GPU перед стартом Ollama.
+
+При запуске `docker compose up` для этого проекта контейнер FastAPI будет
+обращаться к Ollama по адресу `http://host.docker.internal:11434`. При
+необходимости можно переопределить переменную `OLLAMA_HOST` в
+`docker-compose.yml` или задать её при запуске.
 
 ## Работа с API
 
