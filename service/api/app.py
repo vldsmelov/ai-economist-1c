@@ -69,6 +69,25 @@ def _ollama_base_urls() -> Tuple[str, ...]:
     return _DEFAULT_OLLAMA_BASE_URLS
 
 
+def _normalise_base_url(url: str) -> str:
+    return url.rstrip("/")
+
+
+def _ollama_base_urls() -> Tuple[str, ...]:
+    env_hosts = os.getenv("OLLAMA_HOST", "")
+    if env_hosts:
+        parts = re.split(r"[,\s]+", env_hosts)
+        normalised = tuple(
+            _normalise_base_url(part.strip())
+            for part in parts
+            if part and part.strip()
+        )
+        if normalised:
+            return normalised
+
+    return _DEFAULT_OLLAMA_BASE_URLS
+
+
 def _build_budget_response() -> BudgetResponse:
     category_objects = budget_manager.categories()
     categories = [
