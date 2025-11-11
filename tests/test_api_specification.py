@@ -12,7 +12,9 @@ from starlette.requests import Request
 
 app_module = importlib.import_module("service.api.app")
 SpecificationExtractResponse = app_module.SpecificationExtractResponse
+PurchaseAnalysisResponse = app_module.PurchaseAnalysisResponse
 extract_specification = app_module.extract_specification
+analyse_purchases_endpoint = app_module.analyse_purchases_endpoint
 
 
 @pytest.fixture(autouse=True)
@@ -24,6 +26,38 @@ def _patch_llm(monkeypatch: pytest.MonkeyPatch) -> Generator[None, None, None]:
 
     monkeypatch.setattr(app_module, "_ollama_find_specification_anchors", _fake_llm)
     yield
+
+
+@pytest.fixture
+def analysis_stub() -> PurchaseAnalysisResponse:
+    return PurchaseAnalysisResponse.model_validate(
+        {
+            "Электроника": {
+                "товары": ["Ноутбук"],
+                "доступный_бюджет": 1_000.0,
+                "необходимая_сумма": 900.0,
+                "достаточно": "Да",
+            },
+            "категория_не_определена": {
+                "товары": ["Прочее"],
+                "доступный_бюджет": "неопределено",
+                "необходимая_сумма": 100.0,
+                "достаточно": "неопределено",
+            },
+        }
+    )
+
+
+@pytest.fixture(autouse=True)
+def _patch_spec_analysis(
+    monkeypatch: pytest.MonkeyPatch,
+    analysis_stub: PurchaseAnalysisResponse,
+) -> None:
+    monkeypatch.setattr(
+        app_module,
+        "_analyse_specification_text",
+        lambda content: analysis_stub,
+    )
 
 
 @pytest.fixture
@@ -48,7 +82,9 @@ def _build_request(body: bytes, content_type: str) -> Request:
 
 
 @pytest.mark.anyio
-async def test_specification_accepts_json_body() -> None:
+async def test_specification_accepts_json_body(
+    analysis_stub: PurchaseAnalysisResponse,
+) -> None:
     request = _build_request(
         json.dumps({"text": _SPEC_TEXT}).encode("utf-8"),
         "application/json",
@@ -60,10 +96,13 @@ async def test_specification_accepts_json_body() -> None:
     assert response.method == "regex_fallback"
     assert "Приложение № 1" in response.content
     assert "В том числе НДС" in response.content
+    assert response.analysis == analysis_stub
 
 
 @pytest.mark.anyio
-async def test_specification_accepts_file_upload() -> None:
+async def test_specification_accepts_file_upload(
+    analysis_stub: PurchaseAnalysisResponse,
+) -> None:
     file_payload = (
         b"--boundary\r\n"
         b"Content-Disposition: form-data; name=\"file\"; filename=\"spec.txt\"\r\n"
@@ -82,6 +121,7 @@ async def test_specification_accepts_file_upload() -> None:
     assert response.method == "regex_fallback"
     assert response.notes is not None
     assert "Текст получен из загруженного файла" in response.notes
+    assert response.analysis == analysis_stub
 
 
 @pytest.mark.anyio
@@ -93,3 +133,35 @@ async def test_specification_rejects_empty_payload() -> None:
 
     assert excinfo.value.status_code == 400
     assert excinfo.value.detail == "Документ пуст или не содержит данных"
+
+
+@pytest.mark.anyio
+async def test_analyse_endpoint_processes_uploaded_file(
+    monkeypatch: pytest.MonkeyPatch,
+    analysis_stub: PurchaseAnalysisResponse,
+) -> None:
+    captured: dict[str, str] = {}
+
+    def _capture(content: str) -> PurchaseAnalysisResponse:
+        captured["content"] = content
+        return analysis_stub
+
+    monkeypatch.setattr(app_module, "_analyse_specification_text", _capture)
+
+    file_payload = (
+        b"--boundary\r\n"
+        b"Content-Disposition: form-data; name=\"file\"; filename=\"spec.txt\"\r\n"
+        b"Content-Type: text/plain\r\n\r\n"
+        + _SPEC_TEXT.encode("utf-8-sig")
+        + b"\r\n--boundary--\r\n"
+    )
+    request = _build_request(
+        file_payload,
+        "multipart/form-data; boundary=boundary",
+    )
+
+    response = await analyse_purchases_endpoint(request)
+
+    assert response == analysis_stub
+    assert "Приложение № 1" in captured["content"]
+    assert "В том числе НДС" in captured["content"]

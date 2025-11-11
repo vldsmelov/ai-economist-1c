@@ -2,14 +2,17 @@
 from __future__ import annotations
 
 import json
+import os
 import re
+from dataclasses import dataclass
 from typing import Any, Iterable, Optional, Tuple
 from urllib import error, request
 
 from fastapi import FastAPI, HTTPException, Request
+from pydantic import ValidationError
 
 from ..budget import (
-    CategorySummary,
+    BudgetCategory,
     PurchaseItem,
     _normalise_number,
     budget_manager,
@@ -18,21 +21,52 @@ from ..budget import (
 from .schemas import (
     BudgetCategoryResponse,
     BudgetResponse,
-    CategorySummaryResponse,
     PurchaseAnalysisResponse,
-    PurchaseAllocationResponse,
     PurchaseTableRequest,
     SpecificationExtractResponse,
 )
 
+
+@dataclass(slots=True)
+class _SpecificationSection:
+    content: str
+    start: int
+    end: int
+    begin_anchor: str
+    end_anchor: str
+    method: str
+    notes: list[str]
+
 app = FastAPI(title="AI Economist Budgeting Service", version="1.0.0")
 
-OLLAMA_MODEL = "krith/qwen2.5-32b-instruct:IQ4_XS"
-OLLAMA_BASE_URLS: Tuple[str, ...] = (
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "krith/qwen2.5-32b-instruct:IQ4_XS")
+_DEFAULT_OLLAMA_BASE_URLS: Tuple[str, ...] = (
     "http://localhost:11434",
     "http://127.0.0.1:11434",
 )
 OLLAMA_TIMEOUT = 300.0
+
+UNCATEGORISED_CATEGORY = "категория_не_определена"
+UNKNOWN_VALUE = "неопределено"
+
+
+def _normalise_base_url(url: str) -> str:
+    return url.rstrip("/")
+
+
+def _ollama_base_urls() -> Tuple[str, ...]:
+    env_hosts = os.getenv("OLLAMA_HOST", "")
+    if env_hosts:
+        parts = re.split(r"[,\s]+", env_hosts)
+        normalised = tuple(
+            _normalise_base_url(part.strip())
+            for part in parts
+            if part and part.strip()
+        )
+        if normalised:
+            return normalised
+
+    return _DEFAULT_OLLAMA_BASE_URLS
 
 
 def _build_budget_response() -> BudgetResponse:
@@ -49,16 +83,6 @@ def _build_budget_response() -> BudgetResponse:
     return BudgetResponse(categories=categories, total_limit=total_limit)
 
 
-def _summary_to_schema(summary: CategorySummary) -> CategorySummaryResponse:
-    return CategorySummaryResponse(
-        category=summary.category,
-        required=summary.required,
-        available=summary.available,
-        remaining=summary.remaining,
-        is_enough=summary.is_enough,
-    )
-
-
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
@@ -66,7 +90,7 @@ def health() -> dict[str, str]:
 
 def _iter_ollama_urls(path: str) -> Iterable[str]:
     normalized_path = path if path.startswith("/") else f"/{path}"
-    for base in OLLAMA_BASE_URLS:
+    for base in _ollama_base_urls():
         yield f"{base.rstrip('/')}{normalized_path}"
 
 
@@ -188,6 +212,248 @@ def _extract_json_object(text: str) -> dict[str, Any]:
         idx = brace_index + offset
 
     raise ValueError("Ответ LLM не содержит корректный JSON-объект")
+
+
+def _llm_extract_purchases_table(
+    document_text: str,
+    *,
+    context_description: str = "полный текст договора",
+) -> tuple[dict[str, dict[str, object]], list]:
+    cleaned_content = document_text.strip()
+    if not cleaned_content:
+        raise HTTPException(status_code=400, detail="Файл пуст или не содержит данных")
+
+    budget_categories = list(budget_manager.categories())
+    categories_payload = [
+        {
+            "category": category.name,
+            "limit": category.limit,
+            "keywords": category.keywords,
+        }
+        for category in budget_categories
+    ]
+    categories_json = json.dumps(categories_payload, ensure_ascii=False, indent=2)
+    if categories_payload:
+        categories_instruction = (
+            "Поле \"категория\" заполни точным названием одной из категорий бюджета из списка "
+            "ниже (см. значение ключа \"category\"). Подбирай категорию на основе названия товара "
+            "и ключевых слов. Если подходящую категорию определить нельзя, используй значение null."
+        )
+    else:
+        categories_instruction = (
+            "Категории бюджета не загружены. Для поля \"категория\" используй значение null."
+        )
+
+    prompt = (
+        f"Тебе передан {context_description}. Найди в нём раздел со спецификацией закупок, извлеки "
+        "таблицу с позициями товаров и только её анализируй. Проигнорируй остальные части документа. "
+        "Ответ должен содержать только один валидный JSON-объект без дополнительных комментариев, текста "
+        "и Markdown-оформления. Каждый ключ — точное наименование товара из таблицы (без порядковых номеров), "
+        "а значение — объект с полями \"цена\", \"количество\", \"сумма\", \"категория\". Значения полей \"цена\", "
+        "\"количество\" и \"сумма\" должны быть строками и полностью совпадать с исходными данными. "
+        "Игнорируй строки с итогами, НДС и прочей служебной информацией. Не заключай ответ в тройные кавычки "
+        "или иные разделители. "
+        + categories_instruction
+        + "\n\nКатегории бюджета (JSON):\n"
+        + categories_json
+        + "\n\nТекст для анализа:\n"
+        + cleaned_content
+    )
+
+    llm_response = _call_llm(prompt)
+
+    try:
+        parsed_response = _extract_json_object(llm_response)
+    except ValueError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    known_categories = {
+        category.normalised_name(): category.name for category in budget_categories
+    }
+
+    validated_response: dict[str, dict[str, object]] = {}
+    for product_name, data in parsed_response.items():
+        if not isinstance(product_name, str) or not isinstance(data, dict):
+            raise HTTPException(
+                status_code=502,
+                detail="Ответ LLM содержит некорректную структуру данных",
+            )
+
+        try:
+            price = data["цена"]
+            quantity = data["количество"]
+            total = data["сумма"]
+        except KeyError as exc:
+            raise HTTPException(
+                status_code=502,
+                detail="Ответ LLM содержит неполные данные о покупках",
+            ) from exc
+
+        if not all(isinstance(value, str) and value for value in (price, quantity, total)):
+            raise HTTPException(
+                status_code=502,
+                detail="Ответ LLM содержит значения в неверном формате",
+            )
+
+        category_value = data.get("категория")
+        if category_value is not None and not isinstance(category_value, str):
+            raise HTTPException(
+                status_code=502,
+                detail="Ответ LLM содержит некорректное значение категории",
+            )
+
+        category_name: str | None = None
+        if isinstance(category_value, str):
+            stripped_category = category_value.strip()
+            if stripped_category:
+                category_name = known_categories.get(
+                    stripped_category.lower(), stripped_category
+                )
+
+        if category_name is None:
+            auto_category, _ = budget_manager.categorise(product_name)
+            category_name = auto_category
+
+        validated_response[product_name] = {
+            "цена": price,
+            "количество": quantity,
+            "сумма": total,
+            "категория": category_name,
+        }
+
+    if not validated_response:
+        raise HTTPException(
+            status_code=502,
+            detail="Ответ LLM не содержит данных о покупках",
+        )
+
+    return validated_response, budget_categories
+
+
+def _summarise_category_records(
+    records: Iterable[tuple[str, float, str | None]],
+    budget_categories: Iterable[BudgetCategory],
+) -> dict[str, dict[str, object]]:
+    category_list = list(budget_categories)
+    category_limits_by_name = {category.name: category.limit for category in category_list}
+    category_limits_by_normalised = {
+        category.normalised_name(): category.limit for category in category_list
+    }
+
+    summary: dict[str, dict[str, object]] = {}
+
+    for description, amount, category_name in records:
+        key = category_name if category_name else UNCATEGORISED_CATEGORY
+        bucket = summary.setdefault(
+            key,
+            {
+                "товары": [],
+                "доступный_бюджет": None,
+                "необходимая_сумма": 0.0,
+                "достаточно": UNKNOWN_VALUE,
+            },
+        )
+        bucket["товары"].append(description)
+        bucket["необходимая_сумма"] = bucket.get("необходимая_сумма", 0.0) + max(amount, 0.0)
+
+    for key, details in summary.items():
+        required_total = round(float(details.get("необходимая_сумма", 0.0)), 2)
+        details["необходимая_сумма"] = required_total
+
+        if key == UNCATEGORISED_CATEGORY:
+            details["доступный_бюджет"] = UNKNOWN_VALUE
+            details["достаточно"] = UNKNOWN_VALUE
+            continue
+
+        available_limit = category_limits_by_name.get(key)
+        if available_limit is None:
+            normalised_key = key.strip().lower()
+            available_limit = category_limits_by_normalised.get(normalised_key)
+
+        if available_limit is None:
+            details["доступный_бюджет"] = UNKNOWN_VALUE
+            details["достаточно"] = UNKNOWN_VALUE
+        else:
+            available_limit = round(float(available_limit), 2)
+            details["доступный_бюджет"] = available_limit
+            details["достаточно"] = "Да" if required_total <= available_limit + 1e-6 else "Нет"
+
+    return summary
+
+
+def _analyse_specification_text(content: str) -> PurchaseAnalysisResponse:
+    purchases_data, budget_categories = _llm_extract_purchases_table(
+        content,
+        context_description="фрагмент спецификации с перечнем закупок",
+    )
+
+    records = [
+        (
+            description,
+            _normalise_number(details["сумма"]),
+            details.get("категория") or None,
+        )
+        for description, details in purchases_data.items()
+    ]
+
+    summary = _summarise_category_records(records, budget_categories)
+    return PurchaseAnalysisResponse.model_validate(summary)
+
+
+def _extract_specification_section(
+    text: str, initial_notes: list[str]
+) -> _SpecificationSection:
+    notes = list(initial_notes)
+
+    tail_limit = 3000
+    if len(text) > tail_limit:
+        analyzed_text = text[-tail_limit:]
+        offset = len(text) - tail_limit
+        notes.append("Анализируем последние 3000 символов документа")
+    else:
+        analyzed_text = text
+        offset = 0
+
+    llm_result = _ollama_find_specification_anchors(analyzed_text)
+    if llm_result:
+        begin_anchor, end_anchor, reason = llm_result
+        if reason:
+            notes.append(reason)
+        span = _find_span_by_anchors(analyzed_text, begin_anchor, end_anchor)
+        if span:
+            start_relative, end_relative = span
+            start = start_relative + offset
+            end = end_relative + offset
+            return _SpecificationSection(
+                content=text[start:end],
+                start=start,
+                end=end,
+                begin_anchor=begin_anchor,
+                end_anchor=end_anchor,
+                method="llm",
+                notes=notes,
+            )
+        notes.append("Не удалось сопоставить якоря с исходным текстом")
+
+    fallback = _regex_fallback(analyzed_text)
+    if fallback:
+        start_relative, end_relative, begin_anchor, end_anchor, method = fallback
+        start = start_relative + offset
+        end = end_relative + offset
+        begin_anchor = text[start : min(end, start + len(begin_anchor))]
+        end_anchor_start = max(start, end - len(end_anchor))
+        end_anchor = text[end_anchor_start:end]
+        return _SpecificationSection(
+            content=text[start:end],
+            start=start,
+            end=end,
+            begin_anchor=begin_anchor,
+            end_anchor=end_anchor,
+            method=method,
+            notes=notes,
+        )
+
+    raise HTTPException(status_code=404, detail="Не удалось найти спецификацию в документе")
 
 
 def _compile_anchor_regex(anchor: str) -> re.Pattern[str]:
@@ -361,16 +627,14 @@ def _decode_request_bytes(data: bytes) -> str:
         return data.decode("utf-8", errors="replace")
 
 
-async def _read_text_from_request(request: Request) -> tuple[str, list[str]]:
-    content_type = request.headers.get("content-type", "").lower()
-    body = await request.body()
-
+def _read_text_from_payload(body: bytes, content_type: str) -> tuple[str, list[str]]:
     if not body:
         raise HTTPException(status_code=400, detail="Документ пуст или не содержит данных")
 
+    lowered_content_type = content_type.lower()
     notes: list[str] = []
 
-    if "multipart/form-data" in content_type:
+    if "multipart/form-data" in lowered_content_type:
         boundary = _extract_boundary(content_type)
         if not boundary:
             raise HTTPException(status_code=400, detail="Не удалось определить границы multipart-формы")
@@ -383,11 +647,11 @@ async def _read_text_from_request(request: Request) -> tuple[str, list[str]]:
 
     decoded_body = _decode_request_bytes(body)
 
-    if "application/json" in content_type or not content_type:
+    if "application/json" in lowered_content_type or not lowered_content_type:
         try:
             payload = json.loads(decoded_body)
         except json.JSONDecodeError:
-            if "application/json" in content_type:
+            if "application/json" in lowered_content_type:
                 raise HTTPException(status_code=400, detail="Некорректный JSON в теле запроса") from None
         else:
             text = payload.get("text") if isinstance(payload, dict) else None
@@ -402,63 +666,34 @@ async def _read_text_from_request(request: Request) -> tuple[str, list[str]]:
     raise HTTPException(status_code=400, detail="Документ пуст или не содержит данных")
 
 
+async def _read_text_from_request(request: Request) -> tuple[str, list[str]]:
+    content_type = request.headers.get("content-type", "")
+    body = await request.body()
+    return _read_text_from_payload(body, content_type)
+
+
 @app.post(
     "/purchases/specification",
     response_model=SpecificationExtractResponse,
 )
 async def extract_specification(request: Request) -> SpecificationExtractResponse:
     text, initial_notes = await _read_text_from_request(request)
-    notes: list[str] = list(initial_notes)
+    section = _extract_specification_section(text, initial_notes)
+    analysis = _analyse_specification_text(section.content)
 
-    tail_limit = 3000
-    if len(text) > tail_limit:
-        analyzed_text = text[-tail_limit:]
-        offset = len(text) - tail_limit
-        notes.append("Анализируем последние 3000 символов документа")
-    else:
-        analyzed_text = text
-        offset = 0
+    response_notes = list(section.notes)
+    response_notes.append("Спецификация проанализирована относительно бюджета")
 
-    llm_result = _ollama_find_specification_anchors(analyzed_text)
-    if llm_result:
-        begin_anchor, end_anchor, reason = llm_result
-        if reason:
-            notes.append(reason)
-        span = _find_span_by_anchors(analyzed_text, begin_anchor, end_anchor)
-        if span:
-            start_relative, end_relative = span
-            start = start_relative + offset
-            end = end_relative + offset
-            return SpecificationExtractResponse(
-                content=text[start:end],
-                start=start,
-                end=end,
-                begin_anchor=begin_anchor,
-                end_anchor=end_anchor,
-                method="llm",
-                notes="; ".join(notes) if notes else None,
-            )
-        notes.append("Не удалось сопоставить якоря с исходным текстом")
-
-    fallback = _regex_fallback(analyzed_text)
-    if fallback:
-        start_relative, end_relative, begin_anchor, end_anchor, method = fallback
-        start = start_relative + offset
-        end = end_relative + offset
-        begin_anchor = text[start : min(end, start + len(begin_anchor))]
-        end_anchor_start = max(start, end - len(end_anchor))
-        end_anchor = text[end_anchor_start:end]
-        return SpecificationExtractResponse(
-            content=text[start:end],
-            start=start,
-            end=end,
-            begin_anchor=begin_anchor,
-            end_anchor=end_anchor,
-            method=method,
-            notes="; ".join(notes) if notes else None,
-        )
-
-    raise HTTPException(status_code=404, detail="Не удалось найти спецификацию в документе")
+    return SpecificationExtractResponse(
+        content=section.content,
+        start=section.start,
+        end=section.end,
+        begin_anchor=section.begin_anchor,
+        end_anchor=section.end_anchor,
+        method=section.method,
+        notes="; ".join(response_notes) if response_notes else None,
+        analysis=analysis,
+    )
 
 
 @app.post("/llm/purchases")
@@ -488,163 +723,19 @@ async def llm_analyse_purchases(request: Request) -> dict[str, object]:
     if not cleaned_content:
         raise HTTPException(status_code=400, detail="Файл пуст или не содержит данных")
 
-    budget_categories = budget_manager.categories()
-    categories_payload = [
-        {
-            "category": category.name,
-            "limit": category.limit,
-            "keywords": category.keywords,
-        }
-        for category in budget_categories
+    validated_response, budget_categories = _llm_extract_purchases_table(cleaned_content)
+
+    records = [
+        (
+            product_name,
+            _normalise_number(data["сумма"]),
+            data.get("категория") or None,
+        )
+        for product_name, data in validated_response.items()
     ]
-    categories_json = json.dumps(categories_payload, ensure_ascii=False, indent=2)
-    if categories_payload:
-        categories_instruction = (
-            "Поле \"категория\" заполни точным названием одной из категорий бюджета из списка "
-            "ниже (см. значение ключа \"category\"). Подбирай категорию на основе названия товара "
-            "и ключевых слов. Если подходящую категорию определить нельзя, используй значение null."
-        )
-    else:
-        categories_instruction = (
-            "Категории бюджета не загружены. Для поля \"категория\" используй значение null."
-        )
 
-    prompt = (
-        "Тебе передан полный текст договора. Найди в нём раздел со спецификацией закупок, извлеки "
-        "таблицу с позициями товаров и только её анализируй. Проигнорируй остальные части документа. "
-        "Ответ должен содержать только один валидный JSON-объект без дополнительных комментариев, текста "
-        "и Markdown-оформления. Каждый ключ — точное наименование товара из таблицы (без порядковых номеров), "
-        "а значение — объект с полями \"цена\", \"количество\", \"сумма\", \"категория\". Значения полей \"цена\", "
-        "\"количество\" и \"сумма\" должны быть строками и полностью совпадать с исходными данными. "
-        "Игнорируй строки с итогами, НДС и прочей служебной информацией. Не заключай ответ в тройные кавычки "
-        "или иные разделители. "
-        + categories_instruction
-        + "\n\nКатегории бюджета (JSON):\n"
-        + categories_json
-        + "\n\Текст договора:\n"
-        + cleaned_content
-    )
-
-    llm_response = _call_llm(prompt)
-
-    try:
-        parsed_response = _extract_json_object(llm_response)
-    except ValueError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
-
-    known_categories = {
-        category.normalised_name(): category.name for category in budget_categories
-    }
-    category_limits_by_name = {category.name: category.limit for category in budget_categories}
-    category_limits_by_normalised = {
-        category.normalised_name(): category.limit for category in budget_categories
-    }
-    validated_response: dict[str, dict[str, object]] = {}
-    for product_name, data in parsed_response.items():
-        if not isinstance(product_name, str) or not isinstance(data, dict):
-            raise HTTPException(
-                status_code=502,
-                detail="Ответ LLM содержит некорректную структуру данных",
-            )
-
-        try:
-            price = data["цена"]
-            quantity = data["количество"]
-            total = data["сумма"]
-        except KeyError as exc:
-            raise HTTPException(
-                status_code=502,
-                detail="Ответ LLM содержит неполные данные о покупках",
-            ) from exc
-
-        if not all(isinstance(value, str) and value for value in (price, quantity, total)):
-            raise HTTPException(
-                status_code=502,
-                detail="Ответ LLM содержит значения в неверном формате",
-            )
-
-        category_value = data.get("категория")
-        if category_value is not None and not isinstance(category_value, str):
-            raise HTTPException(
-                status_code=502,
-                detail="Ответ LLM содержит некорректное значение категории",
-            )
-
-        category_name: str | None = None
-        if isinstance(category_value, str):
-            stripped_category = category_value.strip()
-            if stripped_category:
-                category_name = known_categories.get(
-                    stripped_category.lower(), stripped_category
-                )
-
-        if category_name is None:
-            auto_category, _ = budget_manager.categorise(product_name)
-            category_name = auto_category
-
-        validated_response[product_name] = {
-            "цена": price,
-            "количество": quantity,
-            "сумма": total,
-            "категория": category_name,
-        }
-
-    if not validated_response:
-        raise HTTPException(
-            status_code=502,
-            detail="Ответ LLM не содержит данных о покупках",
-        )
-
-    def format_number(value: float | None) -> str:
-        if value is None:
-            return ""
-        rounded = round(value)
-        if abs(value - rounded) < 1e-6:
-            return str(int(rounded))
-        return (f"{value:.2f}").rstrip("0").rstrip(".")
-
-    summary: dict[str, dict[str, object]] = {}
-    totals: dict[str, float] = {}
-
-    for product_name, data in validated_response.items():
-        category_name = data["категория"]
-        category_key = category_name if category_name is not None else "null"
-        summary.setdefault(
-            category_key,
-            {
-                "товары": [],
-                "доступный_бюджет": "",
-                "необходимая_сумма": 0.0,
-                "достаточно": "Неизвестно",
-            },
-        )
-        summary[category_key]["товары"].append(product_name)
-        totals[category_key] = totals.get(category_key, 0.0) + _normalise_number(
-            data["сумма"]
-        )
-
-    for category_key, details in summary.items():
-        required_total = totals.get(category_key, 0.0)
-        category_name = None if category_key == "null" else category_key
-        available_limit: float | None = None
-        if category_name is not None:
-            available_limit = category_limits_by_name.get(category_name)
-            if available_limit is None:
-                available_limit = category_limits_by_normalised.get(
-                    category_name.strip().lower()
-                )
-
-        details["необходимая_сумма"] = format_number(required_total)
-        details["доступный_бюджет"] = format_number(available_limit)
-
-        if category_name is None or available_limit is None:
-            details["достаточно"] = "Неизвестно"
-        else:
-            details["достаточно"] = (
-                "Да" if required_total <= available_limit else "Нет"
-            )
-
-    return summary
+    summary = _summarise_category_records(records, budget_categories)
+    return PurchaseAnalysisResponse.model_validate(summary).model_dump(mode="json")
 
 
 @app.post("/budget", response_model=BudgetResponse)
@@ -679,7 +770,27 @@ def get_budget() -> BudgetResponse:
     return _build_budget_response()
 
 
-@app.post("/purchases/analyze", response_model=PurchaseAnalysisResponse)
+def _analyse_purchase_items(
+    purchases: Iterable[PurchaseItem],
+) -> PurchaseAnalysisResponse:
+    purchase_list = list(purchases)
+    budget_categories = budget_manager.categories()
+
+    if not budget_categories:
+        raise HTTPException(status_code=400, detail="Budget is not loaded")
+
+    records: list[tuple[str, float, str | None]] = []
+    for purchase in purchase_list:
+        category_name, _ = budget_manager.categorise(
+            purchase.description,
+            category_hint=purchase.category_hint,
+        )
+        records.append((purchase.description, max(purchase.amount, 0.0), category_name))
+
+    summary = _summarise_category_records(records, budget_categories)
+    return PurchaseAnalysisResponse.model_validate(summary)
+
+
 def analyse_purchases(request: PurchaseTableRequest) -> PurchaseAnalysisResponse:
     purchases = [
         PurchaseItem(
@@ -689,38 +800,33 @@ def analyse_purchases(request: PurchaseTableRequest) -> PurchaseAnalysisResponse
         )
         for row in request.purchases
     ]
-    try:
-        result = budget_manager.analyse(purchases)
-    except ValueError as exc:  # Budget not loaded
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    budget_summary = [_summary_to_schema(summary) for summary in result.summaries]
-    enough = [_summary_to_schema(summary) for summary in result.enough()]
-    not_enough = [_summary_to_schema(summary) for summary in result.not_enough()]
-    allocations = [
-        PurchaseAllocationResponse(
-            description=allocation.description,
-            amount=allocation.amount,
-            category=allocation.category,
-            matched_keyword=allocation.matched_keyword,
-        )
-        for allocation in result.allocations
-    ]
-    uncategorised = [
-        PurchaseAllocationResponse(
-            description=allocation.description,
-            amount=allocation.amount,
-            category=None,
-            matched_keyword=None,
-        )
-        for allocation in result.uncategorised()
-    ]
+    return _analyse_purchase_items(purchases)
 
-    return PurchaseAnalysisResponse(
-        recognised_categories=result.recognised_categories(),
-        enough=enough,
-        not_enough=not_enough,
-        budget_summary=budget_summary,
-        uncategorised_purchases=uncategorised,
-        allocations=allocations,
-    )
+
+@app.post("/purchases/analyze", response_model=PurchaseAnalysisResponse)
+async def analyse_purchases_endpoint(request: Request) -> PurchaseAnalysisResponse:
+    content_type = request.headers.get("content-type", "")
+    lowered_content_type = content_type.lower()
+    body = await request.body()
+
+    if "application/json" in lowered_content_type:
+        decoded_body = _decode_request_bytes(body)
+        try:
+            payload = json.loads(decoded_body)
+        except json.JSONDecodeError:
+            raise HTTPException(status_code=400, detail="Некорректный JSON в теле запроса") from None
+
+        if isinstance(payload, dict) and "purchases" in payload:
+            try:
+                table = PurchaseTableRequest.model_validate(payload)
+            except ValidationError as exc:
+                raise HTTPException(
+                    status_code=422,
+                    detail=json.loads(exc.json()),
+                ) from exc
+            return analyse_purchases(table)
+
+    text, notes = _read_text_from_payload(body, content_type)
+    section = _extract_specification_section(text, notes)
+    return _analyse_specification_text(section.content)

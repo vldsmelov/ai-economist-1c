@@ -29,6 +29,20 @@ def anyio_backend() -> str:
     return "asyncio"
 
 
+def test_iter_ollama_urls_respects_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(
+        "OLLAMA_HOST",
+        "http://ollama:11434, http://proxy.internal:8080/base/",
+    )
+
+    urls = list(app_module._iter_ollama_urls("/api/chat"))
+
+    assert urls == [
+        "http://ollama:11434/api/chat",
+        "http://proxy.internal:8080/base/api/chat",
+    ]
+
+
 def test_llmtest_returns_response(monkeypatch: pytest.MonkeyPatch) -> None:
     def fake_urlopen(*_: Any, **__: Any):  # noqa: ANN401 - signature required
         class _FakeResponse:
@@ -164,15 +178,15 @@ async def test_llm_analyse_purchases_groups_by_category(monkeypatch: pytest.Monk
     assert result == {
         "Оргтехника": {
             "товары": ['17.3" Ноутбук ARDOR Gaming RAGE R17-I7ND405 черный'],
-            "доступный_бюджет": "",
-            "необходимая_сумма": "912594",
-            "достаточно": "Неизвестно",
+            "доступный_бюджет": "неопределено",
+            "необходимая_сумма": 912594.0,
+            "достаточно": "неопределено",
         },
         "Бытовая техника": {
             "товары": ["Холодильник ACELINE B16AMG белый"],
-            "доступный_бюджет": "",
-            "необходимая_сумма": "24699",
-            "достаточно": "Неизвестно",
+            "доступный_бюджет": "неопределено",
+            "необходимая_сумма": 24699.0,
+            "достаточно": "неопределено",
         },
     }
 
@@ -239,8 +253,8 @@ async def test_llm_analyse_purchases_uses_budget_limits(monkeypatch: pytest.Monk
                 '17.3" Ноутбук ARDOR Gaming RAGE R17-I7ND405 черный',
                 "Ноутбук ASUS TUF Gaming A17 FA706NFR-HX017 черный",
             ],
-            "доступный_бюджет": "2000000",
-            "необходимая_сумма": "1185588",
+            "доступный_бюджет": 2_000_000.0,
+            "необходимая_сумма": 1_185_588.0,
             "достаточно": "Да",
         }
     }
@@ -287,11 +301,11 @@ async def test_llm_analyse_purchases_groups_null_category(monkeypatch: pytest.Mo
     result = await llm_analyse_purchases(request)
 
     assert result == {
-        "null": {
+        "категория_не_определена": {
             "товары": ["Электрочайник Polaris PWK"],
-            "доступный_бюджет": "",
-            "необходимая_сумма": "5329",
-            "достаточно": "Неизвестно",
+            "доступный_бюджет": "неопределено",
+            "необходимая_сумма": 5329.0,
+            "достаточно": "неопределено",
         }
     }
 

@@ -1,9 +1,9 @@
 """Pydantic schemas for the AI Economist budgeting API."""
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import List, Optional, Union
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, RootModel, field_validator
 
 
 class BudgetRow(BaseModel):
@@ -54,28 +54,15 @@ class PurchaseTableRequest(BaseModel):
     purchases: List[PurchaseRow] = Field(..., min_length=1, description="Таблица с закупками")
 
 
-class PurchaseAllocationResponse(BaseModel):
-    description: str
-    amount: float
-    category: Optional[str]
-    matched_keyword: Optional[str]
+class PurchaseCategorySummary(BaseModel):
+    товары: List[str]
+    доступный_бюджет: Optional[Union[float, str]]
+    необходимая_сумма: float
+    достаточно: str
 
 
-class CategorySummaryResponse(BaseModel):
-    category: str
-    required: float
-    available: float
-    remaining: float
-    is_enough: bool
-
-
-class PurchaseAnalysisResponse(BaseModel):
-    recognised_categories: List[str]
-    enough: List[CategorySummaryResponse]
-    not_enough: List[CategorySummaryResponse]
-    budget_summary: List[CategorySummaryResponse]
-    uncategorised_purchases: List[PurchaseAllocationResponse]
-    allocations: List[PurchaseAllocationResponse]
+class PurchaseAnalysisResponse(RootModel[dict[str, PurchaseCategorySummary]]):
+    pass
 
 
 class SpecificationExtractRequest(BaseModel):
@@ -90,3 +77,7 @@ class SpecificationExtractResponse(BaseModel):
     end_anchor: str = Field(..., description="Якорная фраза, найденная LLM для конца")
     method: str = Field(..., description="'llm' или 'regex_fallback'")
     notes: Optional[str] = Field(None, description="Пояснение/диагностика")
+    analysis: Optional[PurchaseAnalysisResponse] = Field(
+        None,
+        description="Результат анализа закупок на основе извлечённой спецификации",
+    )
