@@ -12,7 +12,7 @@ from fastapi import FastAPI, HTTPException, Request
 from pydantic import ValidationError
 
 from ..budget import (
-    CategorySummary,
+    BudgetCategory,
     PurchaseItem,
     _normalise_number,
     budget_manager,
@@ -21,9 +21,7 @@ from ..budget import (
 from .schemas import (
     BudgetCategoryResponse,
     BudgetResponse,
-    CategorySummaryResponse,
     PurchaseAnalysisResponse,
-    PurchaseAllocationResponse,
     PurchaseTableRequest,
     SpecificationExtractResponse,
 )
@@ -47,6 +45,28 @@ _DEFAULT_OLLAMA_BASE_URLS: Tuple[str, ...] = (
     "http://127.0.0.1:11434",
 )
 OLLAMA_TIMEOUT = 300.0
+
+UNCATEGORISED_CATEGORY = "категория_не_определена"
+UNKNOWN_VALUE = "неопределено"
+
+
+def _normalise_base_url(url: str) -> str:
+    return url.rstrip("/")
+
+
+def _ollama_base_urls() -> Tuple[str, ...]:
+    env_hosts = os.getenv("OLLAMA_HOST", "")
+    if env_hosts:
+        parts = re.split(r"[,\s]+", env_hosts)
+        normalised = tuple(
+            _normalise_base_url(part.strip())
+            for part in parts
+            if part and part.strip()
+        )
+        if normalised:
+            return normalised
+
+    return _DEFAULT_OLLAMA_BASE_URLS
 
 
 def _normalise_base_url(url: str) -> str:
@@ -80,16 +100,6 @@ def _build_budget_response() -> BudgetResponse:
     ]
     total_limit = sum(category.limit for category in category_objects)
     return BudgetResponse(categories=categories, total_limit=total_limit)
-
-
-def _summary_to_schema(summary: CategorySummary) -> CategorySummaryResponse:
-    return CategorySummaryResponse(
-        category=summary.category,
-        required=summary.required,
-        available=summary.available,
-        remaining=summary.remaining,
-        is_enough=summary.is_enough,
-    )
 
 
 @app.get("/health")
@@ -339,22 +349,74 @@ def _llm_extract_purchases_table(
     return validated_response, budget_categories
 
 
+def _summarise_category_records(
+    records: Iterable[tuple[str, float, str | None]],
+    budget_categories: Iterable[BudgetCategory],
+) -> dict[str, dict[str, object]]:
+    category_list = list(budget_categories)
+    category_limits_by_name = {category.name: category.limit for category in category_list}
+    category_limits_by_normalised = {
+        category.normalised_name(): category.limit for category in category_list
+    }
+
+    summary: dict[str, dict[str, object]] = {}
+
+    for description, amount, category_name in records:
+        key = category_name if category_name else UNCATEGORISED_CATEGORY
+        bucket = summary.setdefault(
+            key,
+            {
+                "товары": [],
+                "доступный_бюджет": None,
+                "необходимая_сумма": 0.0,
+                "достаточно": UNKNOWN_VALUE,
+            },
+        )
+        bucket["товары"].append(description)
+        bucket["необходимая_сумма"] = bucket.get("необходимая_сумма", 0.0) + max(amount, 0.0)
+
+    for key, details in summary.items():
+        required_total = round(float(details.get("необходимая_сумма", 0.0)), 2)
+        details["необходимая_сумма"] = required_total
+
+        if key == UNCATEGORISED_CATEGORY:
+            details["доступный_бюджет"] = UNKNOWN_VALUE
+            details["достаточно"] = UNKNOWN_VALUE
+            continue
+
+        available_limit = category_limits_by_name.get(key)
+        if available_limit is None:
+            normalised_key = key.strip().lower()
+            available_limit = category_limits_by_normalised.get(normalised_key)
+
+        if available_limit is None:
+            details["доступный_бюджет"] = UNKNOWN_VALUE
+            details["достаточно"] = UNKNOWN_VALUE
+        else:
+            available_limit = round(float(available_limit), 2)
+            details["доступный_бюджет"] = available_limit
+            details["достаточно"] = "Да" if required_total <= available_limit + 1e-6 else "Нет"
+
+    return summary
+
+
 def _analyse_specification_text(content: str) -> PurchaseAnalysisResponse:
-    purchases_data, _ = _llm_extract_purchases_table(
+    purchases_data, budget_categories = _llm_extract_purchases_table(
         content,
         context_description="фрагмент спецификации с перечнем закупок",
     )
 
-    purchase_items = [
-        PurchaseItem(
-            description=description,
-            amount=_normalise_number(details["сумма"]),
-            category_hint=(details["категория"] or None),
+    records = [
+        (
+            description,
+            _normalise_number(details["сумма"]),
+            details.get("категория") or None,
         )
         for description, details in purchases_data.items()
     ]
 
-    return _analyse_purchase_items(purchase_items)
+    summary = _summarise_category_records(records, budget_categories)
+    return PurchaseAnalysisResponse.model_validate(summary)
 
 
 def _extract_specification_section(
@@ -682,61 +744,17 @@ async def llm_analyse_purchases(request: Request) -> dict[str, object]:
 
     validated_response, budget_categories = _llm_extract_purchases_table(cleaned_content)
 
-    category_limits_by_name = {category.name: category.limit for category in budget_categories}
-    category_limits_by_normalised = {
-        category.normalised_name(): category.limit for category in budget_categories
-    }
-
-    def format_number(value: float | None) -> str:
-        if value is None:
-            return ""
-        rounded = round(value)
-        if abs(value - rounded) < 1e-6:
-            return str(int(rounded))
-        return (f"{value:.2f}").rstrip("0").rstrip(".")
-
-    summary: dict[str, dict[str, object]] = {}
-    totals: dict[str, float] = {}
-
-    for product_name, data in validated_response.items():
-        category_name = data["категория"]
-        category_key = category_name if category_name is not None else "null"
-        summary.setdefault(
-            category_key,
-            {
-                "товары": [],
-                "доступный_бюджет": "",
-                "необходимая_сумма": 0.0,
-                "достаточно": "Неизвестно",
-            },
+    records = [
+        (
+            product_name,
+            _normalise_number(data["сумма"]),
+            data.get("категория") or None,
         )
-        summary[category_key]["товары"].append(product_name)
-        totals[category_key] = totals.get(category_key, 0.0) + _normalise_number(
-            data["сумма"]
-        )
+        for product_name, data in validated_response.items()
+    ]
 
-    for category_key, details in summary.items():
-        required_total = totals.get(category_key, 0.0)
-        category_name = None if category_key == "null" else category_key
-        available_limit: float | None = None
-        if category_name is not None:
-            available_limit = category_limits_by_name.get(category_name)
-            if available_limit is None:
-                available_limit = category_limits_by_normalised.get(
-                    category_name.strip().lower()
-                )
-
-        details["необходимая_сумма"] = format_number(required_total)
-        details["доступный_бюджет"] = format_number(available_limit)
-
-        if category_name is None or available_limit is None:
-            details["достаточно"] = "Неизвестно"
-        else:
-            details["достаточно"] = (
-                "Да" if required_total <= available_limit else "Нет"
-            )
-
-    return summary
+    summary = _summarise_category_records(records, budget_categories)
+    return PurchaseAnalysisResponse.model_validate(summary).model_dump(mode="json")
 
 
 @app.post("/budget", response_model=BudgetResponse)
@@ -775,41 +793,21 @@ def _analyse_purchase_items(
     purchases: Iterable[PurchaseItem],
 ) -> PurchaseAnalysisResponse:
     purchase_list = list(purchases)
-    try:
-        result = budget_manager.analyse(purchase_list)
-    except ValueError as exc:  # Budget not loaded
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    budget_categories = budget_manager.categories()
 
-    budget_summary = [_summary_to_schema(summary) for summary in result.summaries]
-    enough = [_summary_to_schema(summary) for summary in result.enough()]
-    not_enough = [_summary_to_schema(summary) for summary in result.not_enough()]
-    allocations = [
-        PurchaseAllocationResponse(
-            description=allocation.description,
-            amount=allocation.amount,
-            category=allocation.category,
-            matched_keyword=allocation.matched_keyword,
-        )
-        for allocation in result.allocations
-    ]
-    uncategorised = [
-        PurchaseAllocationResponse(
-            description=allocation.description,
-            amount=allocation.amount,
-            category=None,
-            matched_keyword=None,
-        )
-        for allocation in result.uncategorised()
-    ]
+    if not budget_categories:
+        raise HTTPException(status_code=400, detail="Budget is not loaded")
 
-    return PurchaseAnalysisResponse(
-        recognised_categories=result.recognised_categories(),
-        enough=enough,
-        not_enough=not_enough,
-        budget_summary=budget_summary,
-        uncategorised_purchases=uncategorised,
-        allocations=allocations,
-    )
+    records: list[tuple[str, float, str | None]] = []
+    for purchase in purchase_list:
+        category_name, _ = budget_manager.categorise(
+            purchase.description,
+            category_hint=purchase.category_hint,
+        )
+        records.append((purchase.description, max(purchase.amount, 0.0), category_name))
+
+    summary = _summarise_category_records(records, budget_categories)
+    return PurchaseAnalysisResponse.model_validate(summary)
 
 
 def analyse_purchases(request: PurchaseTableRequest) -> PurchaseAnalysisResponse:

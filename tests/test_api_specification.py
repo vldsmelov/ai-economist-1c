@@ -30,13 +30,21 @@ def _patch_llm(monkeypatch: pytest.MonkeyPatch) -> Generator[None, None, None]:
 
 @pytest.fixture
 def analysis_stub() -> PurchaseAnalysisResponse:
-    return PurchaseAnalysisResponse(
-        recognised_categories=[],
-        enough=[],
-        not_enough=[],
-        budget_summary=[],
-        uncategorised_purchases=[],
-        allocations=[],
+    return PurchaseAnalysisResponse.model_validate(
+        {
+            "Электроника": {
+                "товары": ["Ноутбук"],
+                "доступный_бюджет": 1_000.0,
+                "необходимая_сумма": 900.0,
+                "достаточно": "Да",
+            },
+            "категория_не_определена": {
+                "товары": ["Прочее"],
+                "доступный_бюджет": "неопределено",
+                "необходимая_сумма": 100.0,
+                "достаточно": "неопределено",
+            },
+        }
     )
 
 

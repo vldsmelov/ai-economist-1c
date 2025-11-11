@@ -107,24 +107,36 @@ def test_analyse_purchases(client: TestClient, monkeypatch: pytest.MonkeyPatch):
     assert response.status_code == 200
     data = response.json()
 
-    recognised = data["recognised_categories"]
-    assert "Электроника" in recognised
-    assert "Крупная бытовая техника" in recognised
-    assert "Оргтехника" in recognised
+    assert set(data.keys()) == {
+        "Электроника",
+        "Крупная бытовая техника",
+        "Оргтехника",
+        "категория_не_определена",
+    }
 
-    not_enough = {item["category"]: item for item in data["not_enough"]}
-    assert not_enough["Оргтехника"]["is_enough"] is False
-    assert not_enough["Оргтехника"]["required"] == pytest.approx(750_000)
-    assert not_enough["Оргтехника"]["available"] == pytest.approx(600_000)
+    electronics = data["Электроника"]
+    assert electronics["доступный_бюджет"] == pytest.approx(2_000_000)
+    assert electronics["необходимая_сумма"] == pytest.approx(1_200_000)
+    assert electronics["достаточно"] == "Да"
+    assert "Закупка электроники и ноутбуков" in electronics["товары"]
 
-    enough = {item["category"]: item for item in data["enough"]}
-    assert enough["Электроника"]["is_enough"] is True
-    assert enough["Крупная бытовая техника"]["is_enough"] is True
+    appliances = data["Крупная бытовая техника"]
+    assert appliances["доступный_бюджет"] == pytest.approx(5_215_000)
+    assert appliances["необходимая_сумма"] == pytest.approx(500_300)
+    assert appliances["достаточно"] == "Да"
+    assert "Поставка холодильников для офиса" in appliances["товары"]
 
-    uncategorised = data["uncategorised_purchases"]
-    assert any(item["description"] == "Офисная мебель" for item in uncategorised)
+    orgtech = data["Оргтехника"]
+    assert orgtech["доступный_бюджет"] == pytest.approx(600_000)
+    assert orgtech["необходимая_сумма"] == pytest.approx(750_000)
+    assert orgtech["достаточно"] == "Нет"
+    assert "Обслуживание и закупка оргтехники" in orgtech["товары"]
 
-    assert len(data["budget_summary"]) == 3
+    uncategorised = data["категория_не_определена"]
+    assert uncategorised["доступный_бюджет"] == "неопределено"
+    assert uncategorised["достаточно"] == "неопределено"
+    assert uncategorised["необходимая_сумма"] == pytest.approx(25_000)
+    assert "Офисная мебель" in uncategorised["товары"]
 
 
 def test_analyse_without_budget_returns_error(client: TestClient):
