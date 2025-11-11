@@ -90,3 +90,7 @@ class SpecificationExtractResponse(BaseModel):
     end_anchor: str = Field(..., description="Якорная фраза, найденная LLM для конца")
     method: str = Field(..., description="'llm' или 'regex_fallback'")
     notes: Optional[str] = Field(None, description="Пояснение/диагностика")
+    analysis: Optional[PurchaseAnalysisResponse] = Field(
+        None,
+        description="Результат анализа закупок на основе извлечённой спецификации",
+    )

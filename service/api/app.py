@@ -3,10 +3,12 @@ from __future__ import annotations
 
 import json
 import re
+from dataclasses import dataclass
 from typing import Any, Iterable, Optional, Tuple
 from urllib import error, request
 
 from fastapi import FastAPI, HTTPException, Request
+from pydantic import ValidationError
 
 from ..budget import (
     CategorySummary,
@@ -24,6 +26,17 @@ from .schemas import (
     PurchaseTableRequest,
     SpecificationExtractResponse,
 )
+
+
+@dataclass(slots=True)
+class _SpecificationSection:
+    content: str
+    start: int
+    end: int
+    begin_anchor: str
+    end_anchor: str
+    method: str
+    notes: list[str]
 
 app = FastAPI(title="AI Economist Budgeting Service", version="1.0.0")
 
@@ -188,6 +201,196 @@ def _extract_json_object(text: str) -> dict[str, Any]:
         idx = brace_index + offset
 
     raise ValueError("Ответ LLM не содержит корректный JSON-объект")
+
+
+def _llm_extract_purchases_table(
+    document_text: str,
+    *,
+    context_description: str = "полный текст договора",
+) -> tuple[dict[str, dict[str, object]], list]:
+    cleaned_content = document_text.strip()
+    if not cleaned_content:
+        raise HTTPException(status_code=400, detail="Файл пуст или не содержит данных")
+
+    budget_categories = list(budget_manager.categories())
+    categories_payload = [
+        {
+            "category": category.name,
+            "limit": category.limit,
+            "keywords": category.keywords,
+        }
+        for category in budget_categories
+    ]
+    categories_json = json.dumps(categories_payload, ensure_ascii=False, indent=2)
+    if categories_payload:
+        categories_instruction = (
+            "Поле \"категория\" заполни точным названием одной из категорий бюджета из списка "
+            "ниже (см. значение ключа \"category\"). Подбирай категорию на основе названия товара "
+            "и ключевых слов. Если подходящую категорию определить нельзя, используй значение null."
+        )
+    else:
+        categories_instruction = (
+            "Категории бюджета не загружены. Для поля \"категория\" используй значение null."
+        )
+
+    prompt = (
+        f"Тебе передан {context_description}. Найди в нём раздел со спецификацией закупок, извлеки "
+        "таблицу с позициями товаров и только её анализируй. Проигнорируй остальные части документа. "
+        "Ответ должен содержать только один валидный JSON-объект без дополнительных комментариев, текста "
+        "и Markdown-оформления. Каждый ключ — точное наименование товара из таблицы (без порядковых номеров), "
+        "а значение — объект с полями \"цена\", \"количество\", \"сумма\", \"категория\". Значения полей \"цена\", "
+        "\"количество\" и \"сумма\" должны быть строками и полностью совпадать с исходными данными. "
+        "Игнорируй строки с итогами, НДС и прочей служебной информацией. Не заключай ответ в тройные кавычки "
+        "или иные разделители. "
+        + categories_instruction
+        + "\n\nКатегории бюджета (JSON):\n"
+        + categories_json
+        + "\n\nТекст для анализа:\n"
+        + cleaned_content
+    )
+
+    llm_response = _call_llm(prompt)
+
+    try:
+        parsed_response = _extract_json_object(llm_response)
+    except ValueError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    known_categories = {
+        category.normalised_name(): category.name for category in budget_categories
+    }
+
+    validated_response: dict[str, dict[str, object]] = {}
+    for product_name, data in parsed_response.items():
+        if not isinstance(product_name, str) or not isinstance(data, dict):
+            raise HTTPException(
+                status_code=502,
+                detail="Ответ LLM содержит некорректную структуру данных",
+            )
+
+        try:
+            price = data["цена"]
+            quantity = data["количество"]
+            total = data["сумма"]
+        except KeyError as exc:
+            raise HTTPException(
+                status_code=502,
+                detail="Ответ LLM содержит неполные данные о покупках",
+            ) from exc
+
+        if not all(isinstance(value, str) and value for value in (price, quantity, total)):
+            raise HTTPException(
+                status_code=502,
+                detail="Ответ LLM содержит значения в неверном формате",
+            )
+
+        category_value = data.get("категория")
+        if category_value is not None and not isinstance(category_value, str):
+            raise HTTPException(
+                status_code=502,
+                detail="Ответ LLM содержит некорректное значение категории",
+            )
+
+        category_name: str | None = None
+        if isinstance(category_value, str):
+            stripped_category = category_value.strip()
+            if stripped_category:
+                category_name = known_categories.get(
+                    stripped_category.lower(), stripped_category
+                )
+
+        if category_name is None:
+            auto_category, _ = budget_manager.categorise(product_name)
+            category_name = auto_category
+
+        validated_response[product_name] = {
+            "цена": price,
+            "количество": quantity,
+            "сумма": total,
+            "категория": category_name,
+        }
+
+    if not validated_response:
+        raise HTTPException(
+            status_code=502,
+            detail="Ответ LLM не содержит данных о покупках",
+        )
+
+    return validated_response, budget_categories
+
+
+def _analyse_specification_text(content: str) -> PurchaseAnalysisResponse:
+    purchases_data, _ = _llm_extract_purchases_table(
+        content,
+        context_description="фрагмент спецификации с перечнем закупок",
+    )
+
+    purchase_items = [
+        PurchaseItem(
+            description=description,
+            amount=_normalise_number(details["сумма"]),
+            category_hint=(details["категория"] or None),
+        )
+        for description, details in purchases_data.items()
+    ]
+
+    return _analyse_purchase_items(purchase_items)
+
+
+def _extract_specification_section(
+    text: str, initial_notes: list[str]
+) -> _SpecificationSection:
+    notes = list(initial_notes)
+
+    tail_limit = 3000
+    if len(text) > tail_limit:
+        analyzed_text = text[-tail_limit:]
+        offset = len(text) - tail_limit
+        notes.append("Анализируем последние 3000 символов документа")
+    else:
+        analyzed_text = text
+        offset = 0
+
+    llm_result = _ollama_find_specification_anchors(analyzed_text)
+    if llm_result:
+        begin_anchor, end_anchor, reason = llm_result
+        if reason:
+            notes.append(reason)
+        span = _find_span_by_anchors(analyzed_text, begin_anchor, end_anchor)
+        if span:
+            start_relative, end_relative = span
+            start = start_relative + offset
+            end = end_relative + offset
+            return _SpecificationSection(
+                content=text[start:end],
+                start=start,
+                end=end,
+                begin_anchor=begin_anchor,
+                end_anchor=end_anchor,
+                method="llm",
+                notes=notes,
+            )
+        notes.append("Не удалось сопоставить якоря с исходным текстом")
+
+    fallback = _regex_fallback(analyzed_text)
+    if fallback:
+        start_relative, end_relative, begin_anchor, end_anchor, method = fallback
+        start = start_relative + offset
+        end = end_relative + offset
+        begin_anchor = text[start : min(end, start + len(begin_anchor))]
+        end_anchor_start = max(start, end - len(end_anchor))
+        end_anchor = text[end_anchor_start:end]
+        return _SpecificationSection(
+            content=text[start:end],
+            start=start,
+            end=end,
+            begin_anchor=begin_anchor,
+            end_anchor=end_anchor,
+            method=method,
+            notes=notes,
+        )
+
+    raise HTTPException(status_code=404, detail="Не удалось найти спецификацию в документе")
 
 
 def _compile_anchor_regex(anchor: str) -> re.Pattern[str]:
@@ -361,16 +564,14 @@ def _decode_request_bytes(data: bytes) -> str:
         return data.decode("utf-8", errors="replace")
 
 
-async def _read_text_from_request(request: Request) -> tuple[str, list[str]]:
-    content_type = request.headers.get("content-type", "").lower()
-    body = await request.body()
-
+def _read_text_from_payload(body: bytes, content_type: str) -> tuple[str, list[str]]:
     if not body:
         raise HTTPException(status_code=400, detail="Документ пуст или не содержит данных")
 
+    lowered_content_type = content_type.lower()
     notes: list[str] = []
 
-    if "multipart/form-data" in content_type:
+    if "multipart/form-data" in lowered_content_type:
         boundary = _extract_boundary(content_type)
         if not boundary:
             raise HTTPException(status_code=400, detail="Не удалось определить границы multipart-формы")
@@ -383,11 +584,11 @@ async def _read_text_from_request(request: Request) -> tuple[str, list[str]]:
 
     decoded_body = _decode_request_bytes(body)
 
-    if "application/json" in content_type or not content_type:
+    if "application/json" in lowered_content_type or not lowered_content_type:
         try:
             payload = json.loads(decoded_body)
         except json.JSONDecodeError:
-            if "application/json" in content_type:
+            if "application/json" in lowered_content_type:
                 raise HTTPException(status_code=400, detail="Некорректный JSON в теле запроса") from None
         else:
             text = payload.get("text") if isinstance(payload, dict) else None
@@ -402,63 +603,34 @@ async def _read_text_from_request(request: Request) -> tuple[str, list[str]]:
     raise HTTPException(status_code=400, detail="Документ пуст или не содержит данных")
 
 
+async def _read_text_from_request(request: Request) -> tuple[str, list[str]]:
+    content_type = request.headers.get("content-type", "")
+    body = await request.body()
+    return _read_text_from_payload(body, content_type)
+
+
 @app.post(
     "/purchases/specification",
     response_model=SpecificationExtractResponse,
 )
 async def extract_specification(request: Request) -> SpecificationExtractResponse:
     text, initial_notes = await _read_text_from_request(request)
-    notes: list[str] = list(initial_notes)
+    section = _extract_specification_section(text, initial_notes)
+    analysis = _analyse_specification_text(section.content)
 
-    tail_limit = 3000
-    if len(text) > tail_limit:
-        analyzed_text = text[-tail_limit:]
-        offset = len(text) - tail_limit
-        notes.append("Анализируем последние 3000 символов документа")
-    else:
-        analyzed_text = text
-        offset = 0
+    response_notes = list(section.notes)
+    response_notes.append("Спецификация проанализирована относительно бюджета")
 
-    llm_result = _ollama_find_specification_anchors(analyzed_text)
-    if llm_result:
-        begin_anchor, end_anchor, reason = llm_result
-        if reason:
-            notes.append(reason)
-        span = _find_span_by_anchors(analyzed_text, begin_anchor, end_anchor)
-        if span:
-            start_relative, end_relative = span
-            start = start_relative + offset
-            end = end_relative + offset
-            return SpecificationExtractResponse(
-                content=text[start:end],
-                start=start,
-                end=end,
-                begin_anchor=begin_anchor,
-                end_anchor=end_anchor,
-                method="llm",
-                notes="; ".join(notes) if notes else None,
-            )
-        notes.append("Не удалось сопоставить якоря с исходным текстом")
-
-    fallback = _regex_fallback(analyzed_text)
-    if fallback:
-        start_relative, end_relative, begin_anchor, end_anchor, method = fallback
-        start = start_relative + offset
-        end = end_relative + offset
-        begin_anchor = text[start : min(end, start + len(begin_anchor))]
-        end_anchor_start = max(start, end - len(end_anchor))
-        end_anchor = text[end_anchor_start:end]
-        return SpecificationExtractResponse(
-            content=text[start:end],
-            start=start,
-            end=end,
-            begin_anchor=begin_anchor,
-            end_anchor=end_anchor,
-            method=method,
-            notes="; ".join(notes) if notes else None,
-        )
-
-    raise HTTPException(status_code=404, detail="Не удалось найти спецификацию в документе")
+    return SpecificationExtractResponse(
+        content=section.content,
+        start=section.start,
+        end=section.end,
+        begin_anchor=section.begin_anchor,
+        end_anchor=section.end_anchor,
+        method=section.method,
+        notes="; ".join(response_notes) if response_notes else None,
+        analysis=analysis,
+    )
 
 
 @app.post("/llm/purchases")
@@ -488,112 +660,12 @@ async def llm_analyse_purchases(request: Request) -> dict[str, object]:
     if not cleaned_content:
         raise HTTPException(status_code=400, detail="Файл пуст или не содержит данных")
 
-    budget_categories = budget_manager.categories()
-    categories_payload = [
-        {
-            "category": category.name,
-            "limit": category.limit,
-            "keywords": category.keywords,
-        }
-        for category in budget_categories
-    ]
-    categories_json = json.dumps(categories_payload, ensure_ascii=False, indent=2)
-    if categories_payload:
-        categories_instruction = (
-            "Поле \"категория\" заполни точным названием одной из категорий бюджета из списка "
-            "ниже (см. значение ключа \"category\"). Подбирай категорию на основе названия товара "
-            "и ключевых слов. Если подходящую категорию определить нельзя, используй значение null."
-        )
-    else:
-        categories_instruction = (
-            "Категории бюджета не загружены. Для поля \"категория\" используй значение null."
-        )
+    validated_response, budget_categories = _llm_extract_purchases_table(cleaned_content)
 
-    prompt = (
-        "Тебе передан полный текст договора. Найди в нём раздел со спецификацией закупок, извлеки "
-        "таблицу с позициями товаров и только её анализируй. Проигнорируй остальные части документа. "
-        "Ответ должен содержать только один валидный JSON-объект без дополнительных комментариев, текста "
-        "и Markdown-оформления. Каждый ключ — точное наименование товара из таблицы (без порядковых номеров), "
-        "а значение — объект с полями \"цена\", \"количество\", \"сумма\", \"категория\". Значения полей \"цена\", "
-        "\"количество\" и \"сумма\" должны быть строками и полностью совпадать с исходными данными. "
-        "Игнорируй строки с итогами, НДС и прочей служебной информацией. Не заключай ответ в тройные кавычки "
-        "или иные разделители. "
-        + categories_instruction
-        + "\n\nКатегории бюджета (JSON):\n"
-        + categories_json
-        + "\n\Текст договора:\n"
-        + cleaned_content
-    )
-
-    llm_response = _call_llm(prompt)
-
-    try:
-        parsed_response = _extract_json_object(llm_response)
-    except ValueError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
-
-    known_categories = {
-        category.normalised_name(): category.name for category in budget_categories
-    }
     category_limits_by_name = {category.name: category.limit for category in budget_categories}
     category_limits_by_normalised = {
         category.normalised_name(): category.limit for category in budget_categories
     }
-    validated_response: dict[str, dict[str, object]] = {}
-    for product_name, data in parsed_response.items():
-        if not isinstance(product_name, str) or not isinstance(data, dict):
-            raise HTTPException(
-                status_code=502,
-                detail="Ответ LLM содержит некорректную структуру данных",
-            )
-
-        try:
-            price = data["цена"]
-            quantity = data["количество"]
-            total = data["сумма"]
-        except KeyError as exc:
-            raise HTTPException(
-                status_code=502,
-                detail="Ответ LLM содержит неполные данные о покупках",
-            ) from exc
-
-        if not all(isinstance(value, str) and value for value in (price, quantity, total)):
-            raise HTTPException(
-                status_code=502,
-                detail="Ответ LLM содержит значения в неверном формате",
-            )
-
-        category_value = data.get("категория")
-        if category_value is not None and not isinstance(category_value, str):
-            raise HTTPException(
-                status_code=502,
-                detail="Ответ LLM содержит некорректное значение категории",
-            )
-
-        category_name: str | None = None
-        if isinstance(category_value, str):
-            stripped_category = category_value.strip()
-            if stripped_category:
-                category_name = known_categories.get(
-                    stripped_category.lower(), stripped_category
-                )
-
-        if category_name is None:
-            auto_category, _ = budget_manager.categorise(product_name)
-            category_name = auto_category
-
-        validated_response[product_name] = {
-            "цена": price,
-            "количество": quantity,
-            "сумма": total,
-            "категория": category_name,
-        }
-
-    if not validated_response:
-        raise HTTPException(
-            status_code=502,
-            detail="Ответ LLM не содержит данных о покупках",
-        )
 
     def format_number(value: float | None) -> str:
         if value is None:
@@ -679,18 +751,12 @@ def get_budget() -> BudgetResponse:
     return _build_budget_response()
 
 
-@app.post("/purchases/analyze", response_model=PurchaseAnalysisResponse)
-def analyse_purchases(request: PurchaseTableRequest) -> PurchaseAnalysisResponse:
-    purchases = [
-        PurchaseItem(
-            description=row.description,
-            amount=row.amount,
-            category_hint=row.category_hint,
-        )
-        for row in request.purchases
-    ]
+def _analyse_purchase_items(
+    purchases: Iterable[PurchaseItem],
+) -> PurchaseAnalysisResponse:
+    purchase_list = list(purchases)
     try:
-        result = budget_manager.analyse(purchases)
+        result = budget_manager.analyse(purchase_list)
     except ValueError as exc:  # Budget not loaded
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -724,3 +790,44 @@ def analyse_purchases(request: PurchaseTableRequest) -> PurchaseAnalysisResponse
         uncategorised_purchases=uncategorised,
         allocations=allocations,
     )
+
+
+def analyse_purchases(request: PurchaseTableRequest) -> PurchaseAnalysisResponse:
+    purchases = [
+        PurchaseItem(
+            description=row.description,
+            amount=row.amount,
+            category_hint=row.category_hint,
+        )
+        for row in request.purchases
+    ]
+
+    return _analyse_purchase_items(purchases)
+
+
+@app.post("/purchases/analyze", response_model=PurchaseAnalysisResponse)
+async def analyse_purchases_endpoint(request: Request) -> PurchaseAnalysisResponse:
+    content_type = request.headers.get("content-type", "")
+    lowered_content_type = content_type.lower()
+    body = await request.body()
+
+    if "application/json" in lowered_content_type:
+        decoded_body = _decode_request_bytes(body)
+        try:
+            payload = json.loads(decoded_body)
+        except json.JSONDecodeError:
+            raise HTTPException(status_code=400, detail="Некорректный JSON в теле запроса") from None
+
+        if isinstance(payload, dict) and "purchases" in payload:
+            try:
+                table = PurchaseTableRequest.model_validate(payload)
+            except ValidationError as exc:
+                raise HTTPException(
+                    status_code=422,
+                    detail=json.loads(exc.json()),
+                ) from exc
+            return analyse_purchases(table)
+
+    text, notes = _read_text_from_payload(body, content_type)
+    section = _extract_specification_section(text, notes)
+    return _analyse_specification_text(section.content)
