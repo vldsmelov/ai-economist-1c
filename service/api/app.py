@@ -410,14 +410,25 @@ async def extract_specification(request: Request) -> SpecificationExtractRespons
     text, initial_notes = await _read_text_from_request(request)
     notes: list[str] = list(initial_notes)
 
-    llm_result = _ollama_find_specification_anchors(text)
+    tail_limit = 3000
+    if len(text) > tail_limit:
+        analyzed_text = text[-tail_limit:]
+        offset = len(text) - tail_limit
+        notes.append("Анализируем последние 3000 символов документа")
+    else:
+        analyzed_text = text
+        offset = 0
+
+    llm_result = _ollama_find_specification_anchors(analyzed_text)
     if llm_result:
         begin_anchor, end_anchor, reason = llm_result
         if reason:
             notes.append(reason)
-        span = _find_span_by_anchors(text, begin_anchor, end_anchor)
+        span = _find_span_by_anchors(analyzed_text, begin_anchor, end_anchor)
         if span:
-            start, end = span
+            start_relative, end_relative = span
+            start = start_relative + offset
+            end = end_relative + offset
             return SpecificationExtractResponse(
                 content=text[start:end],
                 start=start,
@@ -429,9 +440,14 @@ async def extract_specification(request: Request) -> SpecificationExtractRespons
             )
         notes.append("Не удалось сопоставить якоря с исходным текстом")
 
-    fallback = _regex_fallback(text)
+    fallback = _regex_fallback(analyzed_text)
     if fallback:
-        start, end, begin_anchor, end_anchor, method = fallback
+        start_relative, end_relative, begin_anchor, end_anchor, method = fallback
+        start = start_relative + offset
+        end = end_relative + offset
+        begin_anchor = text[start : min(end, start + len(begin_anchor))]
+        end_anchor_start = max(start, end - len(end_anchor))
+        end_anchor = text[end_anchor_start:end]
         return SpecificationExtractResponse(
             content=text[start:end],
             start=start,
