@@ -76,3 +76,17 @@ class PurchaseAnalysisResponse(BaseModel):
     budget_summary: List[CategorySummaryResponse]
     uncategorised_purchases: List[PurchaseAllocationResponse]
     allocations: List[PurchaseAllocationResponse]
+
+
+class SpecificationExtractRequest(BaseModel):
+    text: str = Field(..., min_length=1, description="Полный текст документа")
+
+
+class SpecificationExtractResponse(BaseModel):
+    content: str = Field(..., description="Извлечённый раздел как точная подстрока исходного текста")
+    start: int = Field(..., description="Стартовый индекс (UTF-8 Python) в исходной строке")
+    end: int = Field(..., description="Конечный индекс (не включая end)")
+    begin_anchor: str = Field(..., description="Якорная фраза, найденная LLM для начала")
+    end_anchor: str = Field(..., description="Якорная фраза, найденная LLM для конца")
+    method: str = Field(..., description="'llm' или 'regex_fallback'")
+    notes: Optional[str] = Field(None, description="Пояснение/диагностика")

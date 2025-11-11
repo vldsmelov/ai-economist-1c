@@ -2,8 +2,8 @@
 from __future__ import annotations
 
 import json
-import os
-from typing import Any
+import re
+from typing import Any, Optional, Tuple
 from urllib import error, request
 
 from fastapi import FastAPI, HTTPException, Request
@@ -22,9 +22,16 @@ from .schemas import (
     PurchaseAnalysisResponse,
     PurchaseAllocationResponse,
     PurchaseTableRequest,
+    SpecificationExtractRequest,
+    SpecificationExtractResponse,
 )
 
 app = FastAPI(title="AI Economist Budgeting Service", version="1.0.0")
+
+OLLAMA_HOST = "http://localhost:11434"
+OLLAMA_MODEL = "krith/qwen2.5-32b-instruct:IQ4_XS"
+OLLAMA_GENERATE_URL = f"{OLLAMA_HOST.rstrip('/')}/api/generate"
+OLLAMA_CHAT_URL = f"{OLLAMA_HOST.rstrip('/')}/api/chat"
 
 
 def _build_budget_response() -> BudgetResponse:
@@ -59,14 +66,11 @@ def health() -> dict[str, str]:
 def _call_llm(prompt: str) -> str:
     """Send a prompt to the configured Ollama LLM service and return the reply."""
 
-    host = os.getenv("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
-    model = os.getenv("OLLAMA_MODEL", "krith/qwen2.5-32b-instruct:IQ4_XS")
-    url = f"{host}/api/generate"
-    payload = {"model": model, "prompt": prompt, "stream": False}
+    payload = {"model": OLLAMA_MODEL, "prompt": prompt, "stream": False}
 
     encoded_payload = json.dumps(payload).encode("utf-8")
     http_request = request.Request(
-        url,
+        OLLAMA_GENERATE_URL,
         data=encoded_payload,
         headers={"Content-Type": "application/json"},
         method="POST",
@@ -153,6 +157,133 @@ def _extract_json_object(text: str) -> dict[str, Any]:
     raise ValueError("Ответ LLM не содержит корректный JSON-объект")
 
 
+def _compile_anchor_regex(anchor: str) -> re.Pattern[str]:
+    tokens = re.split(r"\s+", anchor.strip())
+    escaped_tokens = [re.escape(token) for token in tokens if token]
+    pattern = r"\\s*".join(escaped_tokens)
+    return re.compile(pattern, flags=re.DOTALL)
+
+
+def _find_span_by_anchors(
+    text: str, begin_anchor: str, end_anchor: str
+) -> Optional[Tuple[int, int]]:
+    if not begin_anchor or not end_anchor:
+        return None
+
+    begin_re = _compile_anchor_regex(begin_anchor)
+    end_re = _compile_anchor_regex(end_anchor)
+
+    begin_match = begin_re.search(text)
+    if not begin_match:
+        return None
+
+    end_match = end_re.search(text, begin_match.end())
+    if not end_match:
+        return None
+
+    return begin_match.start(), end_match.end()
+
+
+def _ollama_find_specification_anchors(
+    text: str,
+) -> Optional[Tuple[str, str, str]]:
+    system_prompt = (
+        "Ты — аккуратный извлекатель юридических разделов. Тебе передают полный текст "
+        "договора на русском. Нужно найти раздел со Спецификацией (он начинается заголовком\n"
+        "'Приложение № 1' и содержит таблицу с позициями/ценами, строку 'ИТОГО' и строку\n"
+        "'В том числе НДС'). Твоя задача — вернуть ДВА коротких якоря из исходного текста:\n"
+        "begin_anchor — первые ~40–160 символов раздела, начиная строго с заголовка;\n"
+        "end_anchor — последние ~40–160 символов раздела, заканчивая на строке с НДС.\n"
+        "Важно: копируй якоря ПО СИМВОЛАМ как в исходнике (без переформатирования), но они могут быть короче раздела.\n"
+        "Верни только JSON без пояснений."
+    )
+
+    user_prompt = {
+        "instruction": (
+            "Найди раздел Спецификации (Приложение № 1) и верни JSON: {\n"
+            '  "begin_anchor": string,\n'
+            '  "end_anchor": string,\n'
+            '  "reason": string\n'
+            "}.\n"
+            "Требования:\n"
+            "- begin_anchor должен начинаться ровно с заголовка 'Приложение' данной Спецификации;\n"
+            "- end_anchor должен оканчиваться на строке с фразой 'В том числе НДС' и суммой;\n"
+            "- длина каждого якоря 40..160 символов;\n"
+            "- никакого текста вне JSON.\n"
+        ),
+        "text": text,
+    }
+
+    payload = {
+        "model": OLLAMA_MODEL,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": json.dumps(user_prompt, ensure_ascii=False)},
+        ],
+        "format": "json",
+        "stream": False,
+        "options": {"temperature": 0.1},
+    }
+
+    encoded_payload = json.dumps(payload).encode("utf-8")
+    http_request = request.Request(
+        OLLAMA_CHAT_URL,
+        data=encoded_payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+
+    try:
+        with request.urlopen(http_request, timeout=300.0) as http_response:
+            body = http_response.read().decode("utf-8")
+            data = json.loads(body)
+    except error.HTTPError:
+        return None
+    except error.URLError:
+        return None
+
+    message = data.get("message") or {}
+    content = message.get("content")
+    if not content:
+        return None
+
+    try:
+        parsed = json.loads(content)
+    except json.JSONDecodeError:
+        return None
+
+    begin_anchor = str(parsed.get("begin_anchor", "")).strip()
+    end_anchor = str(parsed.get("end_anchor", "")).strip()
+    reason = str(parsed.get("reason", "")).strip()
+
+    if 40 <= len(begin_anchor) <= 400 and 40 <= len(end_anchor) <= 400:
+        return begin_anchor, end_anchor, reason
+
+    return None
+
+
+def _regex_fallback(
+    text: str,
+) -> Optional[Tuple[int, int, str, str, str]]:
+    start_re = re.compile(r"Приложение\s*№\s*1", re.IGNORECASE | re.DOTALL)
+    end_re = re.compile(r"В\s*том\s*числе\s*НДС[^\n]*?(?:\n.+)?", re.IGNORECASE)
+
+    start_match = start_re.search(text)
+    if not start_match:
+        return None
+
+    end_match = end_re.search(text, start_match.start())
+    if not end_match:
+        return None
+
+    start = start_match.start()
+    end = end_match.end()
+    begin_anchor = text[start : min(len(text), start + 140)]
+    end_anchor = text[max(start, end - 140) : end]
+
+    return start, end, begin_anchor, end_anchor, "regex_fallback"
+
+
 @app.get("/llmtest")
 def llm_test() -> dict[str, str]:
     """Send a test prompt to the configured Ollama LLM service."""
@@ -197,6 +328,54 @@ def _parse_multipart_file(body: bytes, boundary: str) -> bytes:
         return data.rstrip(b"\r\n")
 
     raise HTTPException(status_code=400, detail="Не удалось прочитать файл из формы")
+
+
+@app.post(
+    "/purchases/specification",
+    response_model=SpecificationExtractResponse,
+)
+def extract_specification(
+    request: SpecificationExtractRequest,
+) -> SpecificationExtractResponse:
+    text = request.text
+    if not text or not text.strip():
+        raise HTTPException(status_code=400, detail="Документ пуст или не содержит данных")
+
+    notes: list[str] = []
+
+    llm_result = _ollama_find_specification_anchors(text)
+    if llm_result:
+        begin_anchor, end_anchor, reason = llm_result
+        if reason:
+            notes.append(reason)
+        span = _find_span_by_anchors(text, begin_anchor, end_anchor)
+        if span:
+            start, end = span
+            return SpecificationExtractResponse(
+                content=text[start:end],
+                start=start,
+                end=end,
+                begin_anchor=begin_anchor,
+                end_anchor=end_anchor,
+                method="llm",
+                notes="; ".join(notes) if notes else None,
+            )
+        notes.append("Не удалось сопоставить якоря с исходным текстом")
+
+    fallback = _regex_fallback(text)
+    if fallback:
+        start, end, begin_anchor, end_anchor, method = fallback
+        return SpecificationExtractResponse(
+            content=text[start:end],
+            start=start,
+            end=end,
+            begin_anchor=begin_anchor,
+            end_anchor=end_anchor,
+            method=method,
+            notes="; ".join(notes) if notes else None,
+        )
+
+    raise HTTPException(status_code=404, detail="Не удалось найти спецификацию в документе")
 
 
 @app.post("/llm/purchases")
