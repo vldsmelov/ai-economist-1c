@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Any, Optional, Tuple
+from typing import Any, Iterable, Optional, Tuple
 from urllib import error, request
 
 from fastapi import FastAPI, HTTPException, Request
@@ -28,10 +28,12 @@ from .schemas import (
 
 app = FastAPI(title="AI Economist Budgeting Service", version="1.0.0")
 
-OLLAMA_HOST = "http://localhost:11434"
 OLLAMA_MODEL = "krith/qwen2.5-32b-instruct:IQ4_XS"
-OLLAMA_GENERATE_URL = f"{OLLAMA_HOST.rstrip('/')}/api/generate"
-OLLAMA_CHAT_URL = f"{OLLAMA_HOST.rstrip('/')}/api/chat"
+OLLAMA_BASE_URLS: Tuple[str, ...] = (
+    "http://localhost:11434",
+    "http://127.0.0.1:11434",
+)
+OLLAMA_TIMEOUT = 300.0
 
 
 def _build_budget_response() -> BudgetResponse:
@@ -63,36 +65,68 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
+def _iter_ollama_urls(path: str) -> Iterable[str]:
+    normalized_path = path if path.startswith("/") else f"/{path}"
+    for base in OLLAMA_BASE_URLS:
+        yield f"{base.rstrip('/')}{normalized_path}"
+
+
+def _ollama_request(path: str, payload: dict[str, Any]) -> dict[str, Any]:
+    last_error: error.URLError | None = None
+    encoded_payload = json.dumps(payload).encode("utf-8")
+
+    for url in _iter_ollama_urls(path):
+        http_request = request.Request(
+            url,
+            data=encoded_payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+
+        try:
+            with request.urlopen(http_request, timeout=OLLAMA_TIMEOUT) as http_response:
+                body = http_response.read().decode("utf-8")
+                return json.loads(body)
+        except error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="ignore").strip()
+            raise HTTPException(
+                status_code=502,
+                detail=(
+                    f"LLM service returned error ({exc.code}): "
+                    f"{detail or exc.reason}"
+                ),
+            ) from exc
+        except error.URLError as exc:
+            last_error = exc
+            continue
+
+    if last_error is not None:
+        reason = last_error.reason
+        detail = str(reason) if reason is not None else "connection error"
+        raise HTTPException(
+            status_code=502,
+            detail=f"Failed to reach LLM service: {detail}",
+        ) from last_error
+
+    raise HTTPException(status_code=502, detail="LLM service is unavailable")
+
+
 def _call_llm(prompt: str) -> str:
     """Send a prompt to the configured Ollama LLM service and return the reply."""
 
-    payload = {"model": OLLAMA_MODEL, "prompt": prompt, "stream": False}
+    payload = {
+        "model": OLLAMA_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "stream": False,
+    }
 
-    encoded_payload = json.dumps(payload).encode("utf-8")
-    http_request = request.Request(
-        OLLAMA_GENERATE_URL,
-        data=encoded_payload,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
+    data = _ollama_request("/api/chat", payload)
 
-    try:
-        with request.urlopen(http_request, timeout=300.0) as http_response:
-            body = http_response.read().decode("utf-8")
-            data = json.loads(body)
-    except error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="ignore")
-        raise HTTPException(
-            status_code=502,
-            detail=f"LLM service returned error: {detail or exc.reason}",
-        ) from exc
-    except error.URLError as exc:
-        raise HTTPException(
-            status_code=502,
-            detail=f"Failed to reach LLM service: {exc.reason}",
-        ) from exc
+    message = data.get("message") or {}
+    llm_response = message.get("content")
+    if not llm_response:
+        llm_response = data.get("response") or data.get("message")
 
-    llm_response = data.get("response") or data.get("message")
     if not llm_response:
         raise HTTPException(
             status_code=502,
@@ -225,21 +259,9 @@ def _ollama_find_specification_anchors(
         "options": {"temperature": 0.1},
     }
 
-    encoded_payload = json.dumps(payload).encode("utf-8")
-    http_request = request.Request(
-        OLLAMA_CHAT_URL,
-        data=encoded_payload,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-
     try:
-        with request.urlopen(http_request, timeout=300.0) as http_response:
-            body = http_response.read().decode("utf-8")
-            data = json.loads(body)
-    except error.HTTPError:
-        return None
-    except error.URLError:
+        data = _ollama_request("/api/chat", payload)
+    except HTTPException:
         return None
 
     message = data.get("message") or {}
