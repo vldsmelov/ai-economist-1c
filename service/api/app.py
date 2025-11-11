@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from dataclasses import dataclass
 from typing import Any, Iterable, Optional, Tuple
@@ -40,12 +41,31 @@ class _SpecificationSection:
 
 app = FastAPI(title="AI Economist Budgeting Service", version="1.0.0")
 
-OLLAMA_MODEL = "krith/qwen2.5-32b-instruct:IQ4_XS"
-OLLAMA_BASE_URLS: Tuple[str, ...] = (
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "krith/qwen2.5-32b-instruct:IQ4_XS")
+_DEFAULT_OLLAMA_BASE_URLS: Tuple[str, ...] = (
     "http://localhost:11434",
     "http://127.0.0.1:11434",
 )
 OLLAMA_TIMEOUT = 300.0
+
+
+def _normalise_base_url(url: str) -> str:
+    return url.rstrip("/")
+
+
+def _ollama_base_urls() -> Tuple[str, ...]:
+    env_hosts = os.getenv("OLLAMA_HOST", "")
+    if env_hosts:
+        parts = re.split(r"[,\s]+", env_hosts)
+        normalised = tuple(
+            _normalise_base_url(part.strip())
+            for part in parts
+            if part and part.strip()
+        )
+        if normalised:
+            return normalised
+
+    return _DEFAULT_OLLAMA_BASE_URLS
 
 
 def _build_budget_response() -> BudgetResponse:
@@ -79,7 +99,7 @@ def health() -> dict[str, str]:
 
 def _iter_ollama_urls(path: str) -> Iterable[str]:
     normalized_path = path if path.startswith("/") else f"/{path}"
-    for base in OLLAMA_BASE_URLS:
+    for base in _ollama_base_urls():
         yield f"{base.rstrip('/')}{normalized_path}"
 
 

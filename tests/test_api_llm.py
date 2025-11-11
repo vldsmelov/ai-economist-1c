@@ -29,6 +29,20 @@ def anyio_backend() -> str:
     return "asyncio"
 
 
+def test_iter_ollama_urls_respects_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(
+        "OLLAMA_HOST",
+        "http://ollama:11434, http://proxy.internal:8080/base/",
+    )
+
+    urls = list(app_module._iter_ollama_urls("/api/chat"))
+
+    assert urls == [
+        "http://ollama:11434/api/chat",
+        "http://proxy.internal:8080/base/api/chat",
+    ]
+
+
 def test_llmtest_returns_response(monkeypatch: pytest.MonkeyPatch) -> None:
     def fake_urlopen(*_: Any, **__: Any):  # noqa: ANN401 - signature required
         class _FakeResponse:
