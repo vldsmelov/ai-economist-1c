@@ -22,7 +22,6 @@ from .schemas import (
     PurchaseAnalysisResponse,
     PurchaseAllocationResponse,
     PurchaseTableRequest,
-    SpecificationExtractRequest,
     SpecificationExtractResponse,
 )
 
@@ -352,18 +351,64 @@ def _parse_multipart_file(body: bytes, boundary: str) -> bytes:
     raise HTTPException(status_code=400, detail="Не удалось прочитать файл из формы")
 
 
+def _decode_request_bytes(data: bytes) -> str:
+    if not data:
+        return ""
+
+    try:
+        return data.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        return data.decode("utf-8", errors="replace")
+
+
+async def _read_text_from_request(request: Request) -> tuple[str, list[str]]:
+    content_type = request.headers.get("content-type", "").lower()
+    body = await request.body()
+
+    if not body:
+        raise HTTPException(status_code=400, detail="Документ пуст или не содержит данных")
+
+    notes: list[str] = []
+
+    if "multipart/form-data" in content_type:
+        boundary = _extract_boundary(content_type)
+        if not boundary:
+            raise HTTPException(status_code=400, detail="Не удалось определить границы multipart-формы")
+        file_bytes = _parse_multipart_file(body, boundary)
+        text = _decode_request_bytes(file_bytes)
+        if not text.strip():
+            raise HTTPException(status_code=400, detail="Загруженный файл пуст")
+        notes.append("Текст получен из загруженного файла")
+        return text, notes
+
+    decoded_body = _decode_request_bytes(body)
+
+    if "application/json" in content_type or not content_type:
+        try:
+            payload = json.loads(decoded_body)
+        except json.JSONDecodeError:
+            if "application/json" in content_type:
+                raise HTTPException(status_code=400, detail="Некорректный JSON в теле запроса") from None
+        else:
+            text = payload.get("text") if isinstance(payload, dict) else None
+            if not isinstance(text, str) or not text.strip():
+                raise HTTPException(status_code=400, detail="Поле 'text' отсутствует или пустое")
+            return text, notes
+
+    if decoded_body.strip():
+        notes.append("Текст получен напрямую из тела запроса")
+        return decoded_body, notes
+
+    raise HTTPException(status_code=400, detail="Документ пуст или не содержит данных")
+
+
 @app.post(
     "/purchases/specification",
     response_model=SpecificationExtractResponse,
 )
-def extract_specification(
-    request: SpecificationExtractRequest,
-) -> SpecificationExtractResponse:
-    text = request.text
-    if not text or not text.strip():
-        raise HTTPException(status_code=400, detail="Документ пуст или не содержит данных")
-
-    notes: list[str] = []
+async def extract_specification(request: Request) -> SpecificationExtractResponse:
+    text, initial_notes = await _read_text_from_request(request)
+    notes: list[str] = list(initial_notes)
 
     llm_result = _ollama_find_specification_anchors(text)
     if llm_result:
